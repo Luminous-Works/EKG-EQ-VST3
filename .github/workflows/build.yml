@@ -13,9 +13,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Configure
+      - name: Configure (MSVC x64)
         run: |
-          cmake -B build -G "MinGW Makefiles" `
+          cmake -B build `
+            -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=0 `
             -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=0 `
@@ -24,7 +25,7 @@ jobs:
             -DSMTG_CREATE_MODULE_INFO=0
 
       - name: Build
-        run: cmake --build build --target ekgeq
+        run: cmake --build build --config Release --target ekgeq
 
       - name: Package installer
         run: |

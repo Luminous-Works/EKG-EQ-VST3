@@ -44,9 +44,11 @@ target_compile_features(ekgeq PUBLIC cxx_std_17)
 
 target_link_libraries(ekgeq PRIVATE sdk)
 
-# Static MinGW runtime — no external DLL dependencies
+# Static runtime — no external DLL dependencies
 if(MINGW)
     target_link_options(ekgeq PRIVATE -static-libgcc -static-libstdc++ -static)
+elseif(MSVC)
+    set_property(TARGET ekgeq PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 # Version header (generates projectversion.h in build dir)
