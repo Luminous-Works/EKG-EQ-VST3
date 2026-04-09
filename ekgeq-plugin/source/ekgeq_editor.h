@@ -1,6 +1,6 @@
 #pragma once
 #include "pluginterfaces/gui/iplugview.h"
-#include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "public.sdk/source/vst/vsteditcontroller.h"
 #include "base/source/fobject.h"
 #include "ekgeq_ids.h"
 #include <windows.h>
@@ -16,7 +16,7 @@ static constexpr int EDITOR_H = 240;
 // Pure Win32 — no VSTGUI dependency. 6 band columns × 3 sliders each.
 class EKGEQEditor : public FObject, public IPlugView {
 public:
-    explicit EKGEQEditor(IEditController* controller);
+    explicit EKGEQEditor(EditController* controller);
     ~EKGEQEditor();
 
     // IPlugView
@@ -44,7 +44,7 @@ public:
     void onBypassToggle(bool on);
 
 private:
-    IEditController* _controller;
+    EditController*  _controller;
     IPlugFrame*      _frame   = nullptr;
     HWND             _hwnd    = nullptr;
     HWND             _sliders[18] = {};   // [band*3 + param]

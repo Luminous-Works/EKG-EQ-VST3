@@ -1,7 +1,10 @@
 #include "ekgeq_controller.h"
+#include "ekgeq_editor.h"
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "base/source/fstreamer.h"
 #include <cmath>
+#include <cstring>
 
 // ── Param registration helpers ───────────────────────────────────────
 // Normalized ↔ real conversions (must mirror ekgeq_processor.cpp)
@@ -91,4 +94,11 @@ tresult PLUGIN_API EKGEQController::setComponentState(IBStream* state) {
     setParamNormalized(kBypass, bypass ? 1.0 : 0.0);
 
     return kResultOk;
+}
+
+// ── Editor ───────────────────────────────────────────────────────────
+IPlugView* PLUGIN_API EKGEQController::createView(FIDString name) {
+    if (name && strcmp(name, "editor") == 0)
+        return new EKGEQEditor(static_cast<EditController*>(this));
+    return nullptr;
 }

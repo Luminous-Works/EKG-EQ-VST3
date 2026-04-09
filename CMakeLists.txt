@@ -32,6 +32,8 @@ set(EKGEQ_SOURCES
     ekgeq-plugin/source/ekgeq_processor.cpp
     ekgeq-plugin/source/ekgeq_controller.h
     ekgeq-plugin/source/ekgeq_controller.cpp
+    ekgeq-plugin/source/ekgeq_editor.h
+    ekgeq-plugin/source/ekgeq_editor.cpp
     ekgeq-plugin/source/ekgeq_factory.cpp
 )
 
@@ -42,7 +44,7 @@ smtg_add_vst3plugin(ekgeq
 
 target_compile_features(ekgeq PUBLIC cxx_std_17)
 
-target_link_libraries(ekgeq PRIVATE sdk)
+target_link_libraries(ekgeq PRIVATE sdk comctl32)
 
 # Static runtime — no external DLL dependencies
 if(MINGW)

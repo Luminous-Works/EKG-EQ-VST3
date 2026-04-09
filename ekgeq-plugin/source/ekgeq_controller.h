@@ -1,5 +1,6 @@
 #pragma once
 #include "public.sdk/source/vst/vsteditcontroller.h"
+#include "pluginterfaces/gui/iplugview.h"
 #include "ekgeq_ids.h"
 
 using namespace Steinberg;
@@ -13,4 +14,5 @@ public:
 
     tresult PLUGIN_API initialize(FUnknown* context) override;
     tresult PLUGIN_API setComponentState(IBStream* state) override;
+    IPlugView* PLUGIN_API createView(FIDString name) override;
 };
