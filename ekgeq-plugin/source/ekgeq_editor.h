@@ -10,7 +10,7 @@ using namespace Steinberg::Vst;
 
 // ── Editor dimensions ────────────────────────────────────────────────
 static constexpr int EDITOR_W = 840;
-static constexpr int EDITOR_H = 240;
+static constexpr int EDITOR_H = 270;
 
 // ── EKG-EQ Win32 Editor Panel ───────────────────────────────────────
 // Pure Win32 — no VSTGUI dependency. 6 band columns × 3 sliders each.

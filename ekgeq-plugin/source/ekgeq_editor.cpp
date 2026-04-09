@@ -5,25 +5,37 @@
 #include <cstring>
 
 // ── Layout constants ─────────────────────────────────────────────────
-static const int COLS    = 6;
-static const int COL_W   = EDITOR_W / COLS;   // 140
-static const int SR      = 1000;               // slider range 0-1000
+static const int COLS     = 6;
+static const int COL_W    = EDITOR_W / COLS;   // 140
+static const int SR       = 1000;               // slider range 0-1000
+static const int HEADER_H = 30;                 // top bar height
 
-static const int Y_BAND  = 6;
-static const int Y_GL    = 32;   // GAIN label
-static const int Y_GS    = 48;   // GAIN slider
-static const int Y_GV    = 72;   // GAIN value
-static const int Y_FL    = 96;   // FREQ label
-static const int Y_FS    = 112;  // FREQ slider
-static const int Y_FV    = 136;  // FREQ value
-static const int Y_QL    = 160;  // Q label
-static const int Y_QS    = 176;  // Q slider
-static const int Y_QV    = 200;  // Q value
+static const int Y_BAND  = HEADER_H + 6;    // 36  band name (painted)
+static const int Y_GL    = HEADER_H + 26;   // 56  GAIN label
+static const int Y_GS    = HEADER_H + 42;   // 72  GAIN slider
+static const int Y_GV    = HEADER_H + 66;   // 96  GAIN value
+static const int Y_FL    = HEADER_H + 90;   // 120 FREQ label
+static const int Y_FS    = HEADER_H + 106;  // 136 FREQ slider
+static const int Y_FV    = HEADER_H + 130;  // 160 FREQ value
+static const int Y_QL    = HEADER_H + 154;  // 184 Q label
+static const int Y_QS    = HEADER_H + 170;  // 200 Q slider
+static const int Y_QV    = HEADER_H + 194;  // 224 Q value
 
 // ── Colours ──────────────────────────────────────────────────────────
-static const COLORREF BG    = RGB(7,   7,  13);
-static const COLORREF TEAL  = RGB(0, 212, 184);
-static const COLORREF DIM   = RGB(80,  90, 100);
+static const COLORREF BG       = RGB(7,   7,  13);
+static const COLORREF HDR_BG   = RGB(12, 12,  22);
+static const COLORREF TEAL     = RGB(0, 212, 184);
+static const COLORREF DIM      = RGB(80,  90, 100);
+
+// Per-band accent colors
+static const COLORREF BAND_COLORS[6] = {
+    RGB(120,  90, 255),  // SUB    — violet
+    RGB( 40, 200, 100),  // BASS   — green
+    RGB(  0, 212, 184),  // LO-MID — teal
+    RGB(212, 168,  67),  // MID    — amber (Luminous DNA)
+    RGB(255, 140,   0),  // HI-MID — orange
+    RGB(140, 200, 255),  // AIR    — ice blue
+};
 
 // ── Band / param metadata ────────────────────────────────────────────
 static const char* BAND_LABELS[6]  = {"SUB","BASS","LO-MID","MID","HI-MID","AIR"};
@@ -119,12 +131,7 @@ void EKGEQEditor::createControls(HWND parent) {
 
     for (int b = 0; b < 6; ++b) {
         int x = b * COL_W;
-
-        // Band name label
-        HWND lbl = CreateWindowExA(0,"STATIC", BAND_LABELS[b],
-            WS_CHILD|WS_VISIBLE|SS_CENTER, x+4,Y_BAND,COL_W-8,16,
-            parent, nullptr, hi, nullptr);
-        SendMessage(lbl, WM_SETFONT, (WPARAM)font, TRUE);
+        // Band name is painted in WM_PAINT (per-band color) — no STATIC here
 
         for (int p = 0; p < 3; ++p) {
             int idx = b*3+p;
@@ -154,10 +161,10 @@ void EKGEQEditor::createControls(HWND parent) {
         }
     }
 
-    // Bypass checkbox (top-right)
+    // Bypass — placed in the header bar, far right, clear of all columns
     _bypassBtn = CreateWindowExA(0,"BUTTON","BYPASS",
         WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-        EDITOR_W-78, 6, 72, 18,
+        EDITOR_W-86, 6, 80, 18,
         parent, (HMENU)400, hi, nullptr);
     SendMessage(_bypassBtn, WM_SETFONT, (WPARAM)font, TRUE);
 }
@@ -214,8 +221,10 @@ LRESULT CALLBACK EKGEQEditor::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         self = (EKGEQEditor*)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
     }
 
-    static HBRUSH hBgBrush = nullptr;
-    if (!hBgBrush) hBgBrush = CreateSolidBrush(BG);
+    static HBRUSH hBgBrush  = nullptr;
+    static HBRUSH hHdrBrush = nullptr;
+    if (!hBgBrush)  hBgBrush  = CreateSolidBrush(BG);
+    if (!hHdrBrush) hHdrBrush = CreateSolidBrush(HDR_BG);
 
     switch (msg) {
         case WM_ERASEBKGND: {
@@ -232,8 +241,8 @@ LRESULT CALLBACK EKGEQEditor::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_CTLCOLORBTN: {
             HDC hdc = (HDC)wp;
             SetTextColor(hdc, TEAL);
-            SetBkColor(hdc, BG);
-            return (LRESULT)hBgBrush;
+            SetBkColor(hdc, HDR_BG);
+            return (LRESULT)hHdrBrush;
         }
         case WM_HSCROLL: {
             HWND slider = (HWND)lp;
@@ -251,16 +260,53 @@ LRESULT CALLBACK EKGEQEditor::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-            // Draw column separators
-            HPEN pen = CreatePen(PS_SOLID, 1, DIM);
-            HPEN old = (HPEN)SelectObject(hdc, pen);
+
+            // ── Header bar ────────────────────────────────────────────
+            RECT hdrRect = { 0, 0, EDITOR_W, HEADER_H };
+            FillRect(hdc, &hdrRect, hHdrBrush);
+
+            // "EKG·EQ" title  (\xB7 = middot in Windows-1252)
+            HFONT titleFont = CreateFontA(-14, 0, 0, 0, FW_BOLD,
+                FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, "Courier New");
+            HFONT prevFont = (HFONT)SelectObject(hdc, titleFont);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, TEAL);
+            RECT titleRect = { 8, 0, 250, HEADER_H };
+            DrawTextA(hdc, "EKG\xB7" "EQ", -1, &titleRect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+            // ── Band name labels (per-band colour) ────────────────────
+            for (int b = 0; b < 6; ++b) {
+                int x = b * COL_W;
+                SetTextColor(hdc, BAND_COLORS[b]);
+                RECT bandRect = { x+4, Y_BAND, x+COL_W-4, Y_BAND+16 };
+                DrawTextA(hdc, BAND_LABELS[b], -1, &bandRect,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+
+            SelectObject(hdc, prevFont);
+            DeleteObject(titleFont);
+
+            // ── Header separator (teal line) ──────────────────────────
+            HPEN hdrPen = CreatePen(PS_SOLID, 1, TEAL);
+            HPEN prevPen = (HPEN)SelectObject(hdc, hdrPen);
+            MoveToEx(hdc, 0, HEADER_H - 1, nullptr);
+            LineTo(hdc, EDITOR_W, HEADER_H - 1);
+
+            // ── Column separators ─────────────────────────────────────
+            HPEN sepPen = CreatePen(PS_SOLID, 1, DIM);
+            SelectObject(hdc, sepPen);
+            DeleteObject(hdrPen);
             for (int i = 1; i < COLS; ++i) {
                 int x = i * COL_W;
                 MoveToEx(hdc, x, 0, nullptr);
                 LineTo(hdc, x, EDITOR_H);
             }
-            SelectObject(hdc, old);
-            DeleteObject(pen);
+            SelectObject(hdc, prevPen);
+            DeleteObject(sepPen);
+
             EndPaint(hwnd, &ps);
             return 0;
         }
