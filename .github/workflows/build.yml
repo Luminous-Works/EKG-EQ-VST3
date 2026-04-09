@@ -1,0 +1,77 @@
+name: EKG-EQ VST3 Build
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -B build -G "MinGW Makefiles" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=0 `
+            -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=0 `
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=0 `
+            -DSMTG_RUN_VST_VALIDATOR=0 `
+            -DSMTG_CREATE_MODULE_INFO=0
+
+      - name: Build
+        run: cmake --build build --target ekgeq
+
+      - name: Package installer
+        run: |
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EKG-EQ-Windows-VST3
+          path: EKG-EQ-VST3-Setup-1.0.0-x64.exe
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=0 \
+            -DSMTG_ENABLE_VST3_HOSTING_EXAMPLES=0 \
+            -DSMTG_ENABLE_VSTGUI_SUPPORT=0 \
+            -DSMTG_RUN_VST_VALIDATOR=0 \
+            -DSMTG_CREATE_MODULE_INFO=0
+
+      - name: Build
+        run: cmake --build build --target ekgeq
+
+      - name: Package .pkg installer
+        run: |
+          VST3_BUNDLE="build/VST3/Release/EKG-EQ.vst3"
+          INSTALL_DIR="/Library/Audio/Plug-Ins/VST3"
+          PKG_ROOT="pkg_root"
+          mkdir -p "$PKG_ROOT$INSTALL_DIR"
+          cp -r "$VST3_BUNDLE" "$PKG_ROOT$INSTALL_DIR/EKG-EQ.vst3"
+          pkgbuild \
+            --root "$PKG_ROOT" \
+            --identifier "com.luminousworks.auratone.ekgeq" \
+            --version "1.0.0" \
+            --install-location "/" \
+            EKG-EQ-VST3-Setup-1.0.0-mac.pkg
+
+      - name: Upload Mac installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EKG-EQ-Mac-VST3
+          path: EKG-EQ-VST3-Setup-1.0.0-mac.pkg
