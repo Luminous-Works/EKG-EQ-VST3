@@ -4,22 +4,19 @@
 #include "base/source/fobject.h"
 #include "ekgeq_ids.h"
 #include <windows.h>
+#include "../webview2/include/WebView2.h"
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
-// ── Editor dimensions ────────────────────────────────────────────────
-static constexpr int EDITOR_W = 840;
-static constexpr int EDITOR_H = 270;
+static constexpr int EDITOR_W = 1024;
+static constexpr int EDITOR_H =  540;
 
-// ── EKG-EQ Win32 Editor Panel ───────────────────────────────────────
-// Pure Win32 — no VSTGUI dependency. 6 band columns × 3 sliders each.
 class EKGEQEditor : public FObject, public IPlugView {
 public:
     explicit EKGEQEditor(EditController* controller);
     ~EKGEQEditor();
 
-    // IPlugView
     tresult PLUGIN_API isPlatformTypeSupported(FIDString type) SMTG_OVERRIDE;
     tresult PLUGIN_API attached(void* parent, FIDString type) SMTG_OVERRIDE;
     tresult PLUGIN_API removed() SMTG_OVERRIDE;
@@ -39,22 +36,37 @@ public:
         DEF_INTERFACE(IPlugView)
     END_DEFINE_INTERFACES(FObject)
 
-    // Called by WndProc on slider / button changes
-    void onSliderChange(int ctrlId, int pos);
-    void onBypassToggle(bool on);
-
 private:
-    EditController*  _controller;
-    IPlugFrame*      _frame   = nullptr;
-    HWND             _hwnd    = nullptr;
-    HWND             _sliders[18] = {};   // [band*3 + param]
-    HWND             _valLbls[18] = {};
-    HWND             _bypassBtn   = nullptr;
-    bool             _syncing     = false;
+    EditController*        _controller;
+    IPlugFrame*            _frame       = nullptr;
+    HWND                   _hwnd        = nullptr;
+    bool                   _bypass      = false;
+    double                 _normParams[6][3] = {};
 
-    void createControls(HWND parent);
+    // WebView2 state
+    ICoreWebView2Controller* _wvCtrl    = nullptr;
+    ICoreWebView2*            _wv       = nullptr;
+    bool                      _wvReady  = false;
+    HMODULE                   _wvDLL    = nullptr;
+    EventRegistrationToken    _msgToken   = {};
+    EventRegistrationToken    _accelToken = {};
+
+    // WebView2 factory typedef
+    typedef HRESULT (*CreateEnvFn)(
+        PCWSTR browserExecutableFolder,
+        PCWSTR userDataFolder,
+        ICoreWebView2EnvironmentOptions* environmentOptions,
+        ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler);
+
+    CreateEnvFn loadWebView2Factory();
+
     void syncFromController();
-    void updateLabel(int idx, double norm);
+    void sendAllParamsToJS();
+    void onJSParamChange(LPCWSTR json);
+    std::wstring buildHtmlFileUri() const;
+
+    static std::wstring parseStringField(const std::wstring& json, const wchar_t* key);
+    static double parseDoubleField(const std::wstring& json, const wchar_t* key, double def = 0.0);
 
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     static bool s_classRegistered;

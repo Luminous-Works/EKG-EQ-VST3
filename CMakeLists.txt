@@ -44,13 +44,38 @@ smtg_add_vst3plugin(ekgeq
 
 target_compile_features(ekgeq PUBLIC cxx_std_17)
 
-target_link_libraries(ekgeq PRIVATE sdk comctl32)
+# WebView2 SDK
+target_include_directories(ekgeq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/include
+)
+
+target_link_libraries(ekgeq PRIVATE
+    sdk
+    comctl32
+    gdiplus
+    ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/lib/libWebView2Loader.a
+)
 
 # Static runtime — no external DLL dependencies
 if(MINGW)
     target_link_options(ekgeq PRIVATE -static-libgcc -static-libstdc++ -static)
 elseif(MSVC)
     set_property(TARGET ekgeq PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+# Copy UI files (HTML + JS) into the VST3 bundle Resources/ui/
+if(WIN32)
+    add_custom_command(TARGET ekgeq POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/index.html"
+            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/ekgeq_dsp_engine.js"
+            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui/ekgeq_dsp_engine.js"
+        COMMENT "Copying EKG-EQ UI files to VST3 bundle"
+    )
 endif()
 
 # Version header (generates projectversion.h in build dir)
@@ -61,6 +86,18 @@ if(SMTG_WIN)
     target_sources(ekgeq PRIVATE
         ekgeq-plugin/resource/ekgeq.rc
     )
+endif()
+
+# ── Standalone render test (Windows only) ───────────────────────────────
+if(WIN32)
+    add_executable(ekgeq_test WIN32 standalone_test/main.cpp)
+    target_compile_features(ekgeq_test PUBLIC cxx_std_17)
+    target_link_libraries(ekgeq_test PRIVATE gdiplus)
+    if(MSVC)
+        set_property(TARGET ekgeq_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    elseif(MINGW)
+        target_link_options(ekgeq_test PRIVATE -static-libgcc -static-libstdc++ -static -mwindows)
+    endif()
 endif()
 
 # macOS bundle
