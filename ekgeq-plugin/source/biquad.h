@@ -50,6 +50,18 @@ static BiquadCoeffs makeHighShelf(double fs, double freq, double gainDB, double 
     return { b0/a0, b1/a0, b2/a0, a1/a0, a2/a0 };
 }
 
+static BiquadCoeffs makeBandpass(double fs, double freq, double Q) {
+    double w0    = 2.0 * M_PI * freq / fs;
+    double alpha = std::sin(w0) / (2.0 * Q);
+    double b0 =  alpha;
+    double b1 =  0.0;
+    double b2 = -alpha;
+    double a0 =  1.0 + alpha;
+    double a1 = -2.0 * std::cos(w0);
+    double a2 =  1.0 - alpha;
+    return { b0/a0, b1/a0, b2/a0, a1/a0, a2/a0 };
+}
+
 class BiquadFilter {
 public:
     BiquadFilter() { reset(); }

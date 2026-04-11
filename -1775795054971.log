@@ -1,0 +1,11 @@
+index.html:4123 [EKG·EQ] DOMContentLoaded — init start
+index.html:4126 [EKG·EQ] Engine created, bands: 24
+index.html:4128 [EKG·EQ] Band strip built
+index.html:4131 [EKG·EQ] Layout fitted
+index.html:4146 [EKG·EQ] Boot sequence started
+lumina-aerospace-wordmark.svg:1 
+        
+        
+       Failed to load resource: net::ERR_FILE_NOT_FOUND
+index.html:4135 [EKG·EQ] Canvas ready, RAF loop started
+index.html:4138 [EKG·EQ] VU + AB init done

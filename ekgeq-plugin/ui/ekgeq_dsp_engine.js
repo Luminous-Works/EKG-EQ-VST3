@@ -28,55 +28,33 @@
 //   Low freq → slow tc → high frequency resolution (wide analysis window)
 //   High freq → fast tc → high time resolution (narrow analysis window)
 
+// 24-band parametric EQ — full spectrum 20Hz–20kHz
+// Color gradient: red (sub) → orange → gold → green → cyan → blue → violet (air)
 const EKG_BAND_DEFS = [
-  {
-    id: 0, name: 'SUB',    type: 'lowshelf',
-    freq: 60,    gain: 0, Q: 0.71,
-    fLow: 20,    fHigh: 120,
-    color: '#7A1020', colorHi: '#FF2D55',
-    tc: 0.97,   // slowest — wavelet scale 7-8
-    pcg: true,  // carries S1/S2 cardiac sound analogues
-  },
-  {
-    id: 1, name: 'BASS',   type: 'peaking',
-    freq: 150,   gain: 0, Q: 1.0,
-    fLow: 80,    fHigh: 350,
-    color: '#7A5810', colorHi: '#D4A843',
-    tc: 0.95,   // wavelet scale 5-6
-    pcg: false,
-  },
-  {
-    id: 2, name: 'LO·MID', type: 'peaking',
-    freq: 500,   gain: 0, Q: 1.0,
-    fLow: 280,   fHigh: 950,
-    color: '#005A30', colorHi: '#00FF88',
-    tc: 0.92,   // wavelet scale 4
-    pcg: false,
-  },
-  {
-    id: 3, name: 'MID',    type: 'peaking',
-    freq: 1500,  gain: 0, Q: 1.0,
-    fLow: 900,   fHigh: 3200,
-    color: '#005055', colorHi: '#00D4B8',
-    tc: 0.88,   // wavelet scale 3
-    pcg: false,
-  },
-  {
-    id: 4, name: 'HI·MID', type: 'peaking',
-    freq: 4500,  gain: 0, Q: 1.0,
-    fLow: 2800,  fHigh: 8000,
-    color: '#004466', colorHi: '#00AAFF',
-    tc: 0.82,   // wavelet scale 2
-    pcg: false,
-  },
-  {
-    id: 5, name: 'AIR',    type: 'highshelf',
-    freq: 12000, gain: 0, Q: 0.71,
-    fLow: 7000,  fHigh: 20000,
-    color: '#2A1055', colorHi: '#9B59FF',
-    tc: 0.74,   // fastest — wavelet scale 1
-    pcg: false,
-  },
+  { id:0,  name:'SUB·ω',   type:'lowshelf',  freq:20,    gain:0, Q:0.71, fLow:20,    fHigh:28,    color:'#4A0010', colorHi:'#FF2D55', tc:0.985, pcg:true  },
+  { id:1,  name:'INFRA',   type:'peaking',   freq:32,    gain:0, Q:1.0,  fLow:22,    fHigh:45,    color:'#6A1020', colorHi:'#FF4433', tc:0.980, pcg:true  },
+  { id:2,  name:'SUB',     type:'peaking',   freq:50,    gain:0, Q:1.0,  fLow:36,    fHigh:68,    color:'#7A2010', colorHi:'#FF6633', tc:0.975, pcg:false },
+  { id:3,  name:'DEEP',    type:'peaking',   freq:80,    gain:0, Q:1.0,  fLow:58,    fHigh:105,   color:'#7A3808', colorHi:'#FF8C00', tc:0.970, pcg:false },
+  { id:4,  name:'KICK',    type:'peaking',   freq:120,   gain:0, Q:1.0,  fLow:95,    fHigh:145,   color:'#7A5008', colorHi:'#FFAA00', tc:0.965, pcg:false },
+  { id:5,  name:'BASS',    type:'peaking',   freq:160,   gain:0, Q:1.0,  fLow:130,   fHigh:210,   color:'#7A6010', colorHi:'#D4A843', tc:0.960, pcg:false },
+  { id:6,  name:'WARMTH',  type:'peaking',   freq:250,   gain:0, Q:1.0,  fLow:200,   fHigh:310,   color:'#506010', colorHi:'#BBBB00', tc:0.954, pcg:false },
+  { id:7,  name:'BOX',     type:'peaking',   freq:350,   gain:0, Q:1.0,  fLow:295,   fHigh:420,   color:'#226020', colorHi:'#55CC44', tc:0.948, pcg:false },
+  { id:8,  name:'LO·MID',  type:'peaking',   freq:500,   gain:0, Q:1.0,  fLow:415,   fHigh:620,   color:'#006030', colorHi:'#00EE88', tc:0.942, pcg:false },
+  { id:9,  name:'BODY',    type:'peaking',   freq:700,   gain:0, Q:1.0,  fLow:590,   fHigh:870,   color:'#006050', colorHi:'#00DDC0', tc:0.936, pcg:false },
+  { id:10, name:'MID',     type:'peaking',   freq:1000,  gain:0, Q:1.0,  fLow:840,   fHigh:1250,  color:'#005568', colorHi:'#00C8E8', tc:0.930, pcg:false },
+  { id:11, name:'NASAL',   type:'peaking',   freq:1400,  gain:0, Q:1.0,  fLow:1180,  fHigh:1700,  color:'#004578', colorHi:'#00AAFF', tc:0.922, pcg:false },
+  { id:12, name:'HI·MID',  type:'peaking',   freq:2000,  gain:0, Q:1.0,  fLow:1650,  fHigh:2500,  color:'#003588', colorHi:'#3399FF', tc:0.914, pcg:false },
+  { id:13, name:'UPPER',   type:'peaking',   freq:2800,  gain:0, Q:1.0,  fLow:2300,  fHigh:3500,  color:'#253090', colorHi:'#5577FF', tc:0.906, pcg:false },
+  { id:14, name:'BITE',    type:'peaking',   freq:4000,  gain:0, Q:1.0,  fLow:3200,  fHigh:5000,  color:'#352085', colorHi:'#7755EE', tc:0.897, pcg:false },
+  { id:15, name:'ATTACK',  type:'peaking',   freq:5500,  gain:0, Q:1.0,  fLow:4500,  fHigh:6700,  color:'#401878', colorHi:'#9944DD', tc:0.887, pcg:false },
+  { id:16, name:'SILK',    type:'peaking',   freq:7000,  gain:0, Q:1.0,  fLow:6000,  fHigh:8200,  color:'#460f6c', colorHi:'#AA33CC', tc:0.876, pcg:false },
+  { id:17, name:'CRYSTAL', type:'peaking',   freq:8500,  gain:0, Q:1.0,  fLow:7500,  fHigh:9700,  color:'#420860', colorHi:'#BB44BB', tc:0.864, pcg:false },
+  { id:18, name:'SHEEN',   type:'peaking',   freq:10000, gain:0, Q:1.0,  fLow:9000,  fHigh:11200, color:'#3E0058', colorHi:'#CC55AA', tc:0.851, pcg:false },
+  { id:19, name:'AIR·LO',  type:'peaking',   freq:12000, gain:0, Q:1.0,  fLow:10800, fHigh:13500, color:'#3A0050', colorHi:'#DD66AA', tc:0.837, pcg:false },
+  { id:20, name:'AIR',     type:'peaking',   freq:14000, gain:0, Q:1.0,  fLow:12800, fHigh:15500, color:'#360048', colorHi:'#EE77BB', tc:0.822, pcg:false },
+  { id:21, name:'ULTRA',   type:'peaking',   freq:16000, gain:0, Q:1.0,  fLow:14800, fHigh:17500, color:'#2C0040', colorHi:'#FF88BB', tc:0.806, pcg:false },
+  { id:22, name:'PRES.',   type:'peaking',   freq:18000, gain:0, Q:1.0,  fLow:16500, fHigh:19500, color:'#220038', colorHi:'#FF99CC', tc:0.788, pcg:false },
+  { id:23, name:'AIR·ω',   type:'highshelf', freq:20000, gain:0, Q:0.71, fLow:18500, fHigh:20000, color:'#180030', colorHi:'#FFAADD', tc:0.770, pcg:false },
 ];
 
 class EKGEQEngine {

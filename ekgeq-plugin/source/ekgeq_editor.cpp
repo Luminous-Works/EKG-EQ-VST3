@@ -31,14 +31,14 @@ static constexpr double DB_HI   =  24.0;
 static constexpr double FREQ_LO =   20.0;
 static constexpr double FREQ_HI = 20000.0;
 static constexpr double Q_LO    =   0.1;
-static constexpr double Q_HI    =   10.0;
+static constexpr double Q_HI    =  18.0;  // matches processor: 0.1 + v*17.9
 
 static double normToGain(double n) { return DB_LO + n * (DB_HI - DB_LO); }
 static double normToFreq(double n) { return FREQ_LO * std::pow(FREQ_HI / FREQ_LO, n); }
-static double normToQ   (double n) { return Q_LO * std::pow(Q_HI / Q_LO, n); }
+static double normToQ   (double n) { return Q_LO + n * (Q_HI - Q_LO); }  // linear, matches processor/controller
 static double gainToNorm(double g) { return (g - DB_LO) / (DB_HI - DB_LO); }
 static double freqToNorm(double f) { return std::log(f / FREQ_LO) / std::log(FREQ_HI / FREQ_LO); }
-static double qToNorm   (double q) { return std::log(q / Q_LO) / std::log(Q_HI / Q_LO); }
+static double qToNorm   (double q) { return (q - Q_LO) / (Q_HI - Q_LO); }  // linear, matches processor/controller
 
 // ── Minimal COM callback helpers (no WRL, no std::function needed) ───────────
 // Use template Fn type to avoid MinGW's trouble parsing std::function<R(T*,A*)>
@@ -105,10 +105,10 @@ bool EKGEQEditor::s_classRegistered = false;
 EKGEQEditor::EKGEQEditor(EditController* controller)
     : _controller(controller)
 {
-    for (int b = 0; b < 6; ++b) {
+    for (int b = 0; b < kNumBands; ++b) {
         _normParams[b][0] = gainToNorm(0.0);
-        _normParams[b][1] = freqToNorm(BAND_FREQ_DEFAULT[b]);
-        _normParams[b][2] = qToNorm(BAND_Q_DEFAULT[b]);
+        _normParams[b][1] = freqToNorm(kBandDefs[b].defaultFreq);
+        _normParams[b][2] = qToNorm(kBandDefs[b].defaultQ);
     }
 }
 
@@ -144,8 +144,43 @@ tresult PLUGIN_API EKGEQEditor::getSize(ViewRect* sz) {
     if (!sz) return kInvalidArgument;
     sz->left   = 0;
     sz->top    = 0;
-    sz->right  = EDITOR_W;
-    sz->bottom = EDITOR_H;
+    sz->right  = _currentW;
+    sz->bottom = _currentH;
+    return kResultOk;
+}
+
+tresult PLUGIN_API EKGEQEditor::onSize(ViewRect* newSize) {
+    if (!newSize) return kInvalidArgument;
+
+    int w = newSize->right  - newSize->left;
+    int h = newSize->bottom - newSize->top;
+
+    if (w < 720) w = 720;
+    if (h < 480) h = 480;
+
+    _currentW = w;
+    _currentH = h;
+
+    // PostMessage is safe from any thread. The WndProc (window thread) does the
+    // actual SetWindowPos + WebView2 put_Bounds. Calling those directly here would
+    // violate Win32 cross-thread rules and WebView2's STA requirement.
+    if (_hwnd) {
+        PostMessage(_hwnd, WM_USER + 1, (WPARAM)w, (LPARAM)h);
+    }
+    return kResultOk;
+}
+
+tresult PLUGIN_API EKGEQEditor::checkSizeConstraint(ViewRect* rect) {
+    if (!rect) return kInvalidArgument;
+
+    int w = rect->right  - rect->left;
+    int h = rect->bottom - rect->top;
+
+    if (w < 720) w = 720;
+    if (h < 480) h = 480;
+
+    rect->right  = rect->left + w;
+    rect->bottom = rect->top  + h;
     return kResultOk;
 }
 
@@ -172,7 +207,7 @@ tresult PLUGIN_API EKGEQEditor::attached(void* parent, FIDString type) {
     _hwnd = CreateWindowExW(
         0, EKGEQ_WND_CLASS, L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        0, 0, EDITOR_W, EDITOR_H,
+        0, 0, _currentW, _currentH,
         parentHwnd, nullptr, GetModuleHandle(nullptr), this);
 
     if (!_hwnd) return kResultFalse;
@@ -188,7 +223,9 @@ tresult PLUGIN_API EKGEQEditor::attached(void* parent, FIDString type) {
     // Async chain: Environment → Controller → WebView → Navigate
     // Use makeCB1/makeCB2 factory helpers so the lambda type is deduced
     // automatically — avoids MinGW's std::function template parsing bug.
-    createEnv(nullptr, nullptr, nullptr,
+    // Explicit user data folder keeps our WebView2 env separate from FL Studio's own.
+    const wchar_t* wv2UserData = L"C:\\Users\\Tyrone Cunningham\\AppData\\Local\\EKG-EQ-WebView2";
+    createEnv(nullptr, wv2UserData, nullptr,
         makeCB1<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                 ICoreWebView2Environment>(
             [this](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
@@ -204,7 +241,7 @@ tresult PLUGIN_API EKGEQEditor::attached(void* parent, FIDString type) {
                             _wvCtrl = ctrl;
                             _wvCtrl->AddRef();
 
-                            RECT r { 0, 0, EDITOR_W, EDITOR_H };
+                            RECT r { 0, 0, (LONG)_currentW, (LONG)_currentH };
                             _wvCtrl->put_Bounds(r);
                             _wvCtrl->put_IsVisible(TRUE);
 
@@ -270,7 +307,37 @@ tresult PLUGIN_API EKGEQEditor::attached(void* parent, FIDString type) {
 }
 
 // ── removed() ────────────────────────────────────────────────────────────────
+void EKGEQEditor::receiveSpectrum(const float energy[24]) {
+    if (!_wvReady || !_wv) return;
+    // Build JSON: {"type":"spectrum","bands":[e0,e1,...,e23]}
+    wchar_t json[512];
+    int pos = swprintf(json, 512, L"{\"type\":\"spectrum\",\"bands\":[");
+    for (int i = 0; i < 24 && pos < 480; ++i) {
+        pos += swprintf(json + pos, 512 - pos,
+            i > 0 ? L",%.5f" : L"%.5f", (double)energy[i]);
+    }
+    swprintf(json + pos, 512 - pos, L"]}");
+    _wv->PostWebMessageAsJson(json);
+}
+
+// ── ARIA loopback spectrum ────────────────────────────────────────────────────
+void EKGEQEditor::receiveLoopbackSpectrum(const float energy[24], bool ariaActive) {
+    if (!_wvReady || !_wv) return;
+    // {"type":"loopbackSpectrum","bands":[...],"aria":true}
+    wchar_t json[600];
+    int pos = swprintf(json, 600, L"{\"type\":\"loopbackSpectrum\",\"bands\":[");
+    for (int i = 0; i < 24 && pos < 560; ++i) {
+        pos += swprintf(json + pos, 600 - pos,
+            i > 0 ? L",%.5f" : L"%.5f", (double)energy[i]);
+    }
+    swprintf(json + pos, 600 - pos,
+        L"],\"aria\":%s}", ariaActive ? L"true" : L"false");
+    _wv->PostWebMessageAsJson(json);
+}
+
 tresult PLUGIN_API EKGEQEditor::removed() {
+    // Unregister from controller so dangling pointer can't be used
+    static_cast<EKGEQController*>(_controller)->setEditor(nullptr);
     _wvReady = false;
 
     if (_wv) {
@@ -350,22 +417,14 @@ std::wstring EKGEQEditor::buildHtmlFileUri() const {
     return uri;
 }
 
-// Band parameter ID table
-static constexpr Steinberg::Vst::ParamID PID[6][3] = {
-    { kSub_Gain,   kSub_Freq,   kSub_Q   },
-    { kBass_Gain,  kBass_Freq,  kBass_Q  },
-    { kLoMid_Gain, kLoMid_Freq, kLoMid_Q },
-    { kMid_Gain,   kMid_Freq,   kMid_Q   },
-    { kHiMid_Gain, kHiMid_Freq, kHiMid_Q },
-    { kAir_Gain,   kAir_Freq,   kAir_Q   },
-};
-
 // ── Sync params from controller into _normParams cache ───────────────────────
 void EKGEQEditor::syncFromController() {
     if (!_controller) return;
-    for (int b = 0; b < 6; ++b)
-        for (int p = 0; p < 3; ++p)
-            _normParams[b][p] = _controller->getParamNormalized(PID[b][p]);
+    for (int b = 0; b < kNumBands; ++b) {
+        _normParams[b][0] = _controller->getParamNormalized(kGain(b));
+        _normParams[b][1] = _controller->getParamNormalized(kFreq(b));
+        _normParams[b][2] = _controller->getParamNormalized(kQ(b));
+    }
 }
 
 // ── Push all band params to JS ────────────────────────────────────────────────
@@ -373,10 +432,11 @@ void EKGEQEditor::sendAllParamsToJS() {
     if (!_wvReady || !_wv) return;
     syncFromController();
 
+    // 24 bands × ~40 chars each + wrapper ≈ 1100 chars
     wchar_t json[2048];
     int pos = 0;
     pos += swprintf(json + pos, 2048 - pos, L"{\"type\":\"setParams\",\"bands\":[");
-    for (int b = 0; b < 6; ++b) {
+    for (int b = 0; b < kNumBands && pos < 1900; ++b) {
         double gain = normToGain(_normParams[b][0]);
         double freq = normToFreq(_normParams[b][1]);
         double q    = normToQ   (_normParams[b][2]);
@@ -416,13 +476,13 @@ void EKGEQEditor::onJSParamChange(LPCWSTR jsonW) {
         std::wstring obj = arr.substr(oStart, oEnd - oStart + 1);
         int id = (int)parseDoubleField(obj, L"id", -1.0);
 
-        if (id >= 0 && id < 6) {
+        if (id >= 0 && id < kNumBands) {
             double gain = std::max(DB_LO, std::min(DB_HI,
                 parseDoubleField(obj, L"gain", 0.0)));
             double freq = std::max(FREQ_LO, std::min(FREQ_HI,
-                parseDoubleField(obj, L"freq", BAND_FREQ_DEFAULT[id])));
+                parseDoubleField(obj, L"freq", kBandDefs[id].defaultFreq)));
             double q    = std::max(Q_LO, std::min(Q_HI,
-                parseDoubleField(obj, L"q", BAND_Q_DEFAULT[id])));
+                parseDoubleField(obj, L"q", kBandDefs[id].defaultQ)));
 
             double ng = gainToNorm(gain);
             double nf = freqToNorm(freq);
@@ -438,9 +498,9 @@ void EKGEQEditor::onJSParamChange(LPCWSTR jsonW) {
                     }
                 }
             };
-            commit(0, ng, PID[id][0]);
-            commit(1, nf, PID[id][1]);
-            commit(2, nq, PID[id][2]);
+            commit(0, ng, kGain(id));
+            commit(1, nf, kFreq(id));
+            commit(2, nq, kQ(id));
         }
         pos = oEnd + 1;
     }
@@ -522,6 +582,16 @@ LRESULT CALLBACK EKGEQEditor::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // Re-assert focus on every click so FL Studio can't steal it back
         SetFocus(hwnd);
         return DefWindowProcW(hwnd, msg, wp, lp);
+
+    case WM_USER + 1: {
+        // Deferred resize posted by onSize() — guaranteed to run on the window thread.
+        // SetWindowPos fires WM_SIZE which updates WebView2 bounds below.
+        LONG w = (LONG)wp;
+        LONG h = (LONG)lp;
+        SetWindowPos(hwnd, nullptr, 0, 0, w, h,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
 
     case WM_SIZE:
         if (self && self->_wvCtrl) {

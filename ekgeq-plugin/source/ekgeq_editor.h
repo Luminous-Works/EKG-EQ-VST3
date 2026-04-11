@@ -10,7 +10,7 @@ using namespace Steinberg;
 using namespace Steinberg::Vst;
 
 static constexpr int EDITOR_W = 1024;
-static constexpr int EDITOR_H =  540;
+static constexpr int EDITOR_H =  640;
 
 class EKGEQEditor : public FObject, public IPlugView {
 public:
@@ -21,14 +21,19 @@ public:
     tresult PLUGIN_API attached(void* parent, FIDString type) SMTG_OVERRIDE;
     tresult PLUGIN_API removed() SMTG_OVERRIDE;
     tresult PLUGIN_API getSize(ViewRect* size) SMTG_OVERRIDE;
-    tresult PLUGIN_API onSize(ViewRect*) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API onSize(ViewRect* newSize) SMTG_OVERRIDE;
     tresult PLUGIN_API onFocus(TBool) SMTG_OVERRIDE { return kResultOk; }
     tresult PLUGIN_API setFrame(IPlugFrame* f) SMTG_OVERRIDE { _frame = f; return kResultOk; }
-    tresult PLUGIN_API canResize() SMTG_OVERRIDE { return kResultFalse; }
-    tresult PLUGIN_API checkSizeConstraint(ViewRect*) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API canResize() SMTG_OVERRIDE { return kResultTrue; }
+    tresult PLUGIN_API checkSizeConstraint(ViewRect* rect) SMTG_OVERRIDE;
     tresult PLUGIN_API onWheel(float) SMTG_OVERRIDE { return kResultFalse; }
     tresult PLUGIN_API onKeyDown(char16, int16, int16) SMTG_OVERRIDE { return kResultFalse; }
     tresult PLUGIN_API onKeyUp(char16, int16, int16) SMTG_OVERRIDE { return kResultFalse; }
+
+    // Called by EKGEQController when processor sends spectrum updates
+    void receiveSpectrum        (const float energy[24]);
+    // ARIA loopback spectrum — full system mix via PortCls/KS-Direct
+    void receiveLoopbackSpectrum(const float energy[24], bool ariaActive);
 
     OBJ_METHODS(EKGEQEditor, FObject)
     REFCOUNT_METHODS(FObject)
@@ -41,7 +46,9 @@ private:
     IPlugFrame*            _frame       = nullptr;
     HWND                   _hwnd        = nullptr;
     bool                   _bypass      = false;
-    double                 _normParams[6][3] = {};
+    int                    _currentW    = EDITOR_W;
+    int                    _currentH    = EDITOR_H;
+    double                 _normParams[24][3] = {};
 
     // WebView2 state
     ICoreWebView2Controller* _wvCtrl    = nullptr;

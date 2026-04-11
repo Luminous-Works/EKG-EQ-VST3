@@ -19,7 +19,13 @@ set(SMTG_ENABLE_VSTGUI_SUPPORT       0 CACHE BOOL "" FORCE)
 set(SMTG_RUN_VST_VALIDATOR           0 CACHE BOOL "" FORCE)
 set(SMTG_CREATE_MODULE_INFO          0 CACHE BOOL "" FORCE)
 
-# ── Pull in the SDK ─────────────────────────────────────────────────
+# ── ARIA — Audio Real-time Interface Architecture ────────────────────
+# KS-direct backend: no WASAPI, no AudioSrv, direct to hardware.
+set(ARIA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../ARIA")
+set(ARIA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${ARIA_ROOT} ${CMAKE_BINARY_DIR}/aria)
+
+# ── Pull in the VST3 SDK ─────────────────────────────────────────────
 add_subdirectory(${vst3sdk_SOURCE_DIR} ${PROJECT_BINARY_DIR}/vst3sdk)
 smtg_enable_vst3_sdk()
 
@@ -51,10 +57,13 @@ target_include_directories(ekgeq PRIVATE
 
 target_link_libraries(ekgeq PRIVATE
     sdk
+    aria
     comctl32
     gdiplus
     ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/lib/libWebView2Loader.a
 )
+
+target_include_directories(ekgeq PRIVATE ${ARIA_ROOT}/include)
 
 # Static runtime — no external DLL dependencies
 if(MINGW)
@@ -85,6 +94,54 @@ smtg_target_configure_version_file(ekgeq)
 if(SMTG_WIN)
     target_sources(ekgeq PRIVATE
         ekgeq-plugin/resource/ekgeq.rc
+    )
+endif()
+
+# ── CLAP plugin ─────────────────────────────────────────────────────────────
+if(WIN32)
+    add_library(ekgeq_clap SHARED ekgeq-clap/ekgeq_clap.cpp)
+    target_compile_features(ekgeq_clap PUBLIC cxx_std_17)
+
+    target_include_directories(ekgeq_clap PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/clap-sdk
+        ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/include
+    )
+
+    target_link_libraries(ekgeq_clap PRIVATE
+        aria
+        ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/lib/libWebView2Loader.a
+        ole32 uuid
+    )
+    target_include_directories(ekgeq_clap PRIVATE ${ARIA_ROOT}/include)
+
+    if(MINGW)
+        target_link_options(ekgeq_clap PRIVATE
+            -static-libgcc -static-libstdc++ -static
+        )
+    endif()
+
+    # Output as .clap file (same DLL, different extension)
+    set_target_properties(ekgeq_clap PROPERTIES
+        OUTPUT_NAME "EKG-EQ"
+        SUFFIX ".clap"
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/CLAP"
+    )
+
+    # Copy UI files next to the .clap file
+    add_custom_command(TARGET ekgeq_clap POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${CMAKE_BINARY_DIR}/CLAP/EKG-EQ-ui"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/index.html"
+            "${CMAKE_BINARY_DIR}/CLAP/EKG-EQ-ui/index.html"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/ekgeq_dsp_engine.js"
+            "${CMAKE_BINARY_DIR}/CLAP/EKG-EQ-ui/ekgeq_dsp_engine.js"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/WebView2Loader.dll"
+            "${CMAKE_BINARY_DIR}/CLAP/WebView2Loader.dll"
+        COMMENT "Building EKG-EQ CLAP plugin"
     )
 endif()
 
