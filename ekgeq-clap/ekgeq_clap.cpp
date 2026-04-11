@@ -309,6 +309,21 @@ struct EKGEQClap {
         rebuildTilt();
     }
 
+    // ── Isolated WebView2 user data path ────────────────────────────────────
+    // Must be separate from FL Studio's own WebView2 (Image-Line/Edge/EBWebView).
+    // Passing nullptr to CreateCoreWebView2Environment uses the same default
+    // folder as the host, causing an in-process collision and crash.
+    static std::wstring buildWV2UserDataPath() {
+        wchar_t localApp[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, MAX_PATH))
+            ExpandEnvironmentStringsW(L"%LOCALAPPDATA%", localApp, MAX_PATH);
+        std::wstring p(localApp);
+        p += L"\\EKG-EQ-WebView2";
+        // Ensure directory exists
+        CreateDirectoryW(p.c_str(), nullptr);
+        return p;
+    }
+
     // ── WebView2 file URI ────────────────────────────────────────────────────
     std::wstring buildHtmlUri() {
         static const char s_anchor = 0;
@@ -855,7 +870,8 @@ static bool gui_set_parent(const clap_plugin_t* p, const clap_window_t* win) {
     WV2CreateFn createEnv = loadWV2(&self->wvDLL);
     if (!createEnv) return true;
 
-    createEnv(nullptr, nullptr, nullptr,
+    static std::wstring s_wv2UserData = EKGEQClap::buildWV2UserDataPath();
+    createEnv(nullptr, s_wv2UserData.c_str(), nullptr,
         makeCB1<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                 ICoreWebView2Environment>(
             [self](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {

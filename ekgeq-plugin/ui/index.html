@@ -3106,9 +3106,15 @@ async function activate() {
   const wv = window.chrome && window.chrome.webview;
   if (wv) {
     _active = true;
-    initSpectro(_canvas.width, _canvas.height);
-    updateAllBandUI();
-    setUI(true);
+    try {
+      var _w = (_canvas && _canvas.width)  || 890;
+      var _h = (_canvas && _canvas.height) || 290;
+      initSpectro(_w, _h);
+      updateAllBandUI();
+    } catch(e) {
+      console.warn('[EKG·EQ] activate WebView2 setup error (non-fatal):', e);
+    }
+    setUI(true); // always reaches here — plugin is live
     return; // spectrum arrives via {type:"spectrum"} webview messages
   }
 
@@ -6050,6 +6056,9 @@ window.electronAPI = window.electronAPI || {
         updateFilter(b.id);
         updateBandUI(b.id);
       });
+      // Auto-activate on first setParams — in DAW context the plugin is always live.
+      // User never needs to click STANDBY; the C++ processor is already running.
+      if (!_active) activate();
     } else if (msg.type === 'setBypass') {
       if (msg.bypassed !== _bypassed) toggleBypass();
     } else if (msg.type === 'spectrum') {

@@ -76,13 +76,13 @@ endif()
 if(WIN32)
     add_custom_command(TARGET ekgeq POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory
-            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui"
+            "$<TARGET_FILE_DIR:ekgeq>/../Resources/ui"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/index.html"
-            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui/index.html"
+            "$<TARGET_FILE_DIR:ekgeq>/../Resources/ui/index.html"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/ui/ekgeq_dsp_engine.js"
-            "$<TARGET_FILE_DIR:ekgeq>/../../Resources/ui/ekgeq_dsp_engine.js"
+            "$<TARGET_FILE_DIR:ekgeq>/../Resources/ui/ekgeq_dsp_engine.js"
         COMMENT "Copying EKG-EQ UI files to VST3 bundle"
     )
 endif()

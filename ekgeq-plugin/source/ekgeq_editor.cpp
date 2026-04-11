@@ -221,11 +221,18 @@ tresult PLUGIN_API EKGEQEditor::attached(void* parent, FIDString type) {
     }
 
     // Async chain: Environment → Controller → WebView → Navigate
-    // Use makeCB1/makeCB2 factory helpers so the lambda type is deduced
-    // automatically — avoids MinGW's std::function template parsing bug.
-    // Explicit user data folder keeps our WebView2 env separate from FL Studio's own.
-    const wchar_t* wv2UserData = L"C:\\Users\\Tyrone Cunningham\\AppData\\Local\\EKG-EQ-WebView2";
-    createEnv(nullptr, wv2UserData, nullptr,
+    // Explicit user data folder keeps our WebView2 env separate from any host
+    // (e.g. FL Studio's own Edge/EBWebView). nullptr = collision and crash.
+    static std::wstring s_wv2UserData = []() -> std::wstring {
+        wchar_t loc[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", loc, MAX_PATH))
+            ExpandEnvironmentStringsW(L"%LOCALAPPDATA%", loc, MAX_PATH);
+        std::wstring p(loc);
+        p += L"\\EKG-EQ-WebView2";
+        CreateDirectoryW(p.c_str(), nullptr);
+        return p;
+    }();
+    createEnv(nullptr, s_wv2UserData.c_str(), nullptr,
         makeCB1<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
                 ICoreWebView2Environment>(
             [this](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
