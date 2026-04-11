@@ -105,6 +105,7 @@ if(WIN32)
     target_include_directories(ekgeq_clap PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/clap-sdk
         ${CMAKE_CURRENT_SOURCE_DIR}/ekgeq-plugin/webview2/include
+        ${vst3sdk_SOURCE_DIR}
     )
 
     target_link_libraries(ekgeq_clap PRIVATE

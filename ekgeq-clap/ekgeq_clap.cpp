@@ -1,18 +1,20 @@
 /**
- * EKG·EQ — CLAP Plugin
+ * EKG·EQ — CLAP Plugin  (24 bands + ARIA C·AUTO)
  * Lumina Aerospace · AuraTone Technology
  *
- * CLAP (CLever Audio Plugin) target. Shares the biquad DSP core
- * and WebView2 UI with the VST3 build. Single DLL, .clap extension.
+ * CLAP (CLever Audio Plugin) target. Shares the biquad DSP core,
+ * 24-band topology (ekgeq_ids.h), and WebView2 UI with the VST3 build.
+ * Single DLL, .clap extension.
+ *
+ * C·AUTO: ARIA PortCls/KS-Direct loopback analysis drives per-band
+ * spectral balance correction in real time.
  *
  * Parameters (mirror VST3 IDs exactly):
- *   Band 0 SUB    : gain=0,  freq=1,  Q=2
- *   Band 1 BASS   : gain=10, freq=11, Q=12
- *   Band 2 LO·MID : gain=20, freq=21, Q=22
- *   Band 3 MID    : gain=30, freq=31, Q=32
- *   Band 4 HI·MID : gain=40, freq=41, Q=42
- *   Band 5 AIR    : gain=50, freq=51, Q=52
- *   Bypass        : 100
+ *   Band N gain  = N * 10 + 0   (N = 0..23)
+ *   Band N freq  = N * 10 + 1
+ *   Band N Q     = N * 10 + 2
+ *   Bypass       = 1000
+ *   TLT          = 1001
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -27,67 +29,168 @@
 #include <clap/factory/plugin-factory.h>
 
 #include "../ekgeq-plugin/source/biquad.h"
+#include "../ekgeq-plugin/source/ekgeq_band_defs.h"
 #include "../ekgeq-plugin/webview2/include/WebView2.h"
+
+#include <aria/aria.h>
 
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <string>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <cwchar>
 
-// ── Parameter table ───────────────────────────────────────────────────────────
-struct ParamDef {
+// ════════════════════════════════════════════════════════════════════════════
+// AriaAnalyzer — shared singleton, same pattern as VST3 processor
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+struct AriaAnalyzerClap {
+    std::atomic<float> loopbandEnv[kNumBands];
+    std::atomic<int>   refCount{0};
+    std::mutex         initMtx;
+    bool               ariaRunning = false;
+    BiquadFilter       detL[kNumBands], detR[kNumBands];
+    float              detEnv[kNumBands] = {};
+    bool               filtersBuilt = false;
+
+    AriaAnalyzerClap() {
+        for (int i = 0; i < kNumBands; ++i)
+            loopbandEnv[i].store(0.0f, std::memory_order_relaxed);
+    }
+
+    void buildFilters(double sr) {
+        for (int i = 0; i < kNumBands; ++i) {
+            BiquadCoeffs c = makeBandpass(sr, kBandDefs[i].defaultFreq, 2.0);
+            detL[i].setCoeffs(c); detL[i].reset();
+            detR[i].setCoeffs(c); detR[i].reset();
+        }
+        filtersBuilt = true;
+    }
+
+    void acquire() {
+        if (refCount.fetch_add(1) == 0) {
+            std::lock_guard<std::mutex> lk(initMtx);
+            start();
+        }
+    }
+
+    void release() {
+        if (refCount.fetch_sub(1) == 1) {
+            std::lock_guard<std::mutex> lk(initMtx);
+            stop();
+        }
+    }
+
+    void start() {
+        if (ariaRunning) return;
+        if (aria::init() != aria::Error::None) return;
+        aria::StreamConfig cfg{};
+        cfg.sample_rate = 48000; cfg.channels = 2;
+        cfg.buffer_frames = 480; cfg.loopback = true;
+        if (aria::capture::open_loopback(cfg) != aria::Error::None) {
+            aria::shutdown(); return;
+        }
+        buildFilters(48000.0);
+        if (aria::capture::start([this](const aria::AudioBuffer& buf) {
+                onBuffer(buf); }) != aria::Error::None) {
+            aria::capture::close(); aria::shutdown(); return;
+        }
+        ariaRunning = true;
+    }
+
+    void stop() {
+        if (!ariaRunning) return;
+        aria::capture::stop(); aria::capture::close(); aria::shutdown();
+        ariaRunning = false;
+    }
+
+    void onBuffer(const aria::AudioBuffer& buf) noexcept {
+        if (!filtersBuilt || buf.format != aria::SampleFormat::Float32 || !buf.frame_count) return;
+        const float* data = static_cast<const float*>(buf.data);
+        const uint32_t ch = buf.channels, n = buf.frame_count;
+        double accL[kNumBands] = {}, accR[kNumBands] = {};
+        for (uint32_t s = 0; s < n; ++s) {
+            double xL = data[s * ch], xR = ch > 1 ? data[s * ch + 1] : xL;
+            for (int i = 0; i < kNumBands; ++i) {
+                double yL = detL[i].process(xL), yR = detR[i].process(xR);
+                accL[i] += yL * yL; accR[i] += yR * yR;
+            }
+        }
+        const double kA = 0.96, inv2n = 1.0 / (2.0 * n);
+        for (int i = 0; i < kNumBands; ++i) {
+            float rms = std::sqrt((float)((accL[i] + accR[i]) * inv2n));
+            detEnv[i] = (float)(kA * detEnv[i] + (1.0 - kA) * rms);
+            loopbandEnv[i].store(detEnv[i], std::memory_order_relaxed);
+        }
+    }
+
+    bool isRunning() const noexcept { return ariaRunning; }
+};
+
+static AriaAnalyzerClap s_aria;
+
+} // anonymous namespace
+
+// ════════════════════════════════════════════════════════════════════════════
+// Parameter table — built at runtime from kBandDefs
+// ════════════════════════════════════════════════════════════════════════════
+static constexpr int CLAP_NUM_BANDS  = kNumBands;        // 24
+static constexpr int CLAP_NUM_PARAMS = kNumBands * 3 + 2; // 74
+
+struct ClapParamDef {
     clap_id id;
-    const char* name;
-    const char* module;
-    double min, max, def;
+    char    name  [CLAP_NAME_SIZE];
+    char    module[CLAP_PATH_SIZE];
+    double  minV, maxV, defV;
+    bool    is_bypass;
 };
 
-static const ParamDef PARAMS[] = {
-    // Band 0 SUB
-    {  0, "SUB Gain",    "SUB",    -24, 24,   0 },
-    {  1, "SUB Freq",    "SUB",     20, 20000, 60 },
-    {  2, "SUB Q",       "SUB",    0.1, 10,  0.71 },
-    // Band 1 BASS
-    { 10, "BASS Gain",   "BASS",   -24, 24,   0 },
-    { 11, "BASS Freq",   "BASS",    20, 20000, 150 },
-    { 12, "BASS Q",      "BASS",   0.1, 10,   1.0 },
-    // Band 2 LO·MID
-    { 20, "LO·MID Gain", "LO·MID", -24, 24,   0 },
-    { 21, "LO·MID Freq", "LO·MID",  20, 20000, 500 },
-    { 22, "LO·MID Q",    "LO·MID", 0.1, 10,   1.0 },
-    // Band 3 MID
-    { 30, "MID Gain",    "MID",    -24, 24,   0 },
-    { 31, "MID Freq",    "MID",     20, 20000, 1500 },
-    { 32, "MID Q",       "MID",    0.1, 10,   1.0 },
-    // Band 4 HI·MID
-    { 40, "HI·MID Gain", "HI·MID", -24, 24,   0 },
-    { 41, "HI·MID Freq", "HI·MID",  20, 20000, 4500 },
-    { 42, "HI·MID Q",    "HI·MID", 0.1, 10,   1.0 },
-    // Band 5 AIR
-    { 50, "AIR Gain",    "AIR",    -24, 24,   0 },
-    { 51, "AIR Freq",    "AIR",     20, 20000, 12000 },
-    { 52, "AIR Q",       "AIR",    0.1, 10,  0.71 },
-    // Global
-    {100, "Bypass",      "",        0,   1,   0 },
-};
-static const int PARAM_COUNT = (int)(sizeof(PARAMS) / sizeof(PARAMS[0]));
-static const int BAND_COUNT  = 6;
+static ClapParamDef PARAMS[CLAP_NUM_PARAMS];
+static bool PARAMS_INITIALIZED = false;
 
-// ── Normalize helpers ─────────────────────────────────────────────────────────
-static double normToGain(double n) { return -24.0 + n * 48.0; }
-static double normToFreq(double n) { return 20.0 * std::pow(1000.0, n); }
-static double normToQ   (double n) { return 0.1  * std::pow(100.0,  n); }
-static double gainToNorm(double g) { return (g + 24.0) / 48.0; }
-static double freqToNorm(double f) { return std::log(f / 20.0) / std::log(1000.0); }
-static double qToNorm   (double q) { return std::log(q / 0.1)  / std::log(100.0);  }
+static void initParams() {
+    if (PARAMS_INITIALIZED) return;
+    int idx = 0;
+    for (int b = 0; b < kNumBands; ++b) {
+        const auto& bd = kBandDefs[b];
+        // Gain
+        PARAMS[idx].id = (clap_id)(b * 10);
+        snprintf(PARAMS[idx].name,   sizeof(PARAMS[idx].name),   "%s Gain",  bd.label);
+        snprintf(PARAMS[idx].module, sizeof(PARAMS[idx].module),  "%s",       bd.label);
+        PARAMS[idx].minV = -24; PARAMS[idx].maxV = 24; PARAMS[idx].defV = 0;
+        PARAMS[idx].is_bypass = false; ++idx;
+        // Freq
+        PARAMS[idx].id = (clap_id)(b * 10 + 1);
+        snprintf(PARAMS[idx].name,   sizeof(PARAMS[idx].name),   "%s Freq",  bd.label);
+        snprintf(PARAMS[idx].module, sizeof(PARAMS[idx].module),  "%s",       bd.label);
+        PARAMS[idx].minV = 20; PARAMS[idx].maxV = 20000; PARAMS[idx].defV = bd.defaultFreq;
+        PARAMS[idx].is_bypass = false; ++idx;
+        // Q
+        PARAMS[idx].id = (clap_id)(b * 10 + 2);
+        snprintf(PARAMS[idx].name,   sizeof(PARAMS[idx].name),   "%s Q",     bd.label);
+        snprintf(PARAMS[idx].module, sizeof(PARAMS[idx].module),  "%s",       bd.label);
+        PARAMS[idx].minV = 0.1; PARAMS[idx].maxV = 18; PARAMS[idx].defV = bd.defaultQ;
+        PARAMS[idx].is_bypass = false; ++idx;
+    }
+    // Bypass (ID 1000)
+    PARAMS[idx].id = 1000;
+    snprintf(PARAMS[idx].name,   sizeof(PARAMS[idx].name),   "Bypass");
+    snprintf(PARAMS[idx].module, sizeof(PARAMS[idx].module),  "");
+    PARAMS[idx].minV = 0; PARAMS[idx].maxV = 1; PARAMS[idx].defV = 0;
+    PARAMS[idx].is_bypass = true; ++idx;
+    // Spectral Tilt (ID 1001)
+    PARAMS[idx].id = 1001;
+    snprintf(PARAMS[idx].name,   sizeof(PARAMS[idx].name),   "TLT");
+    snprintf(PARAMS[idx].module, sizeof(PARAMS[idx].module),  "");
+    PARAMS[idx].minV = -12; PARAMS[idx].maxV = 12; PARAMS[idx].defV = 0;
+    PARAMS[idx].is_bypass = false; ++idx;
 
-// Band type by index
-static const char* BAND_TYPES[BAND_COUNT] = {
-    "lowshelf", "peaking", "peaking", "peaking", "peaking", "highshelf"
-};
+    PARAMS_INITIALIZED = true;
+}
 
 // ── COM callback templates (same pattern as VST3 editor) ─────────────────────
 template<class I, class T, class Fn>
@@ -121,110 +224,138 @@ public:
 template<class I, class T, class Fn> CB1<I,T,Fn>* makeCB1(Fn fn) { return new CB1<I,T,Fn>(std::move(fn)); }
 template<class I, class S, class A, class Fn> CB2<I,S,A,Fn>* makeCB2(Fn fn) { return new CB2<I,S,A,Fn>(std::move(fn)); }
 
-// ── EKGEQClap — main plugin struct ───────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// EKGEQClap — main plugin struct
+// ════════════════════════════════════════════════════════════════════════════
 struct EKGEQClap {
     clap_plugin_t         plugin;
     const clap_host_t*    host;
 
     // DSP state
-    double sampleRate  = 44100.0;
-    bool   bypass      = false;
-    double normVal[19] = {};  // indexed by PARAMS[] position
+    double sampleRate = 44100.0;
+    bool   bypass     = false;
+    double tilt       = 0.0;
+    double normVal[CLAP_NUM_PARAMS] = {};
 
-    // Per-band per-channel biquad filters
-    BiquadFilter filters[BAND_COUNT][2]; // [band][ch]
+    // Per-band per-channel biquad chains (24 bands, stereo)
+    BiquadFilter filters[kNumBands][2];  // [band][ch]
+    BiquadFilter tiltL, tiltR;
+
+    // Per-band detection filters (pre-EQ RMS analysis)
+    BiquadFilter detL[kNumBands], detR[kNumBands];
+    float        detEnv[kNumBands] = {};
+    int          detThrottle = 0;
+    static constexpr int kDetInterval = 8;
+
+    // C·AUTO correction (ARIA loopback reference)
+    float cautoGain[kNumBands] = {};
+    bool  cautoEnabled = true;
+    static constexpr float kCautoRate   = 0.00015f;
+    static constexpr float kCautoMaxG   = 6.0f;
+    static constexpr float kCautoMinSig = 1e-5f;
 
     // GUI state
-    HWND                    guiHwnd   = nullptr;
-    HWND                    parentHwnd= nullptr;
-    ICoreWebView2Controller* wvCtrl   = nullptr;
-    ICoreWebView2*           wv       = nullptr;
-    bool                     wvReady  = false;
-    HMODULE                  wvDLL    = nullptr;
-    EventRegistrationToken   msgToken = {};
+    HWND                     guiHwnd    = nullptr;
+    ICoreWebView2Controller* wvCtrl     = nullptr;
+    ICoreWebView2*           wv         = nullptr;
+    bool                     wvReady    = false;
+    HMODULE                  wvDLL      = nullptr;
+    EventRegistrationToken   msgToken   = {};
     EventRegistrationToken   accelToken = {};
 
-    // ── Param helpers ────────────────────────────────────────────────────────
+    // ── Param helpers ─────────────────────────────────────────────────────────
     int paramIndex(clap_id id) const {
-        for (int i = 0; i < PARAM_COUNT; ++i)
+        for (int i = 0; i < CLAP_NUM_PARAMS; ++i)
             if (PARAMS[i].id == id) return i;
         return -1;
     }
+
     double paramPlain(int idx) const {
-        const auto& p = PARAMS[idx];
-        return p.min + normVal[idx] * (p.max - p.min);
+        return PARAMS[idx].minV + normVal[idx] * (PARAMS[idx].maxV - PARAMS[idx].minV);
     }
-    double paramNorm(int idx) const { return normVal[idx]; }
 
     void rebuildFilter(int band) {
-        double fs   = sampleRate;
-        int gi = paramIndex(band * 10);
-        int fi = paramIndex(band * 10 + 1);
-        int qi = paramIndex(band * 10 + 2);
-        double g = paramPlain(gi);
+        if (band < 0 || band >= kNumBands) return;
+        int gi = paramIndex((clap_id)(band * 10));
+        int fi = paramIndex((clap_id)(band * 10 + 1));
+        int qi = paramIndex((clap_id)(band * 10 + 2));
+        if (gi < 0 || fi < 0 || qi < 0) return;
+
+        double g = paramPlain(gi) + (double)cautoGain[band];
         double f = paramPlain(fi);
         double q = paramPlain(qi);
 
         BiquadCoeffs c;
-        if (band == 0) c = makeLowShelf (fs, f, g, q);
-        else if (band == 5) c = makeHighShelf(fs, f, g, q);
-        else c = makePeaking  (fs, f, g, q);
-
+        if (kBandDefs[band].isShelf) {
+            if (kBandDefs[band].isHigh)
+                c = makeHighShelf(sampleRate, f, g, q);
+            else
+                c = makeLowShelf (sampleRate, f, g, q);
+        } else {
+            c = makePeaking(sampleRate, f, g, q);
+        }
         filters[band][0].setCoeffs(c);
         filters[band][1].setCoeffs(c);
     }
 
+    void rebuildTilt() {
+        if (std::fabs(tilt) < 0.001) { tiltL.reset(); tiltR.reset(); return; }
+        BiquadCoeffs c = makeHighShelf(sampleRate, 1000.0, tilt, 0.71);
+        tiltL.setCoeffs(c); tiltR.setCoeffs(c);
+    }
+
+    void rebuildAll() {
+        for (int b = 0; b < kNumBands; ++b) rebuildFilter(b);
+        rebuildTilt();
+    }
+
     // ── WebView2 file URI ────────────────────────────────────────────────────
     std::wstring buildHtmlUri() {
-        // Use a static data-pointer to locate this DLL — avoids function-pointer cast warning
         static const char s_anchor = 0;
         HMODULE hMod = nullptr;
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&s_anchor),
-            &hMod);
+            reinterpret_cast<LPCWSTR>(&s_anchor), &hMod);
         wchar_t p[MAX_PATH] = {};
         GetModuleFileNameW(hMod, p, MAX_PATH);
-        // .clap file is at: ...\CLAP\EKG-EQ.clap
-        // HTML is at:       ...\CLAP\EKG-EQ-ui\index.html
         std::wstring path(p);
         size_t sep = path.rfind(L'\\');
         if (sep != std::wstring::npos) path.resize(sep);
         path += L"\\EKG-EQ-ui\\index.html";
         std::wstring uri = L"file:///";
-        for (wchar_t c : path) {
-            if (c == L'\\') uri += L'/';
-            else if (c == L' ') uri += L"%20";
-            else uri += c;
+        for (wchar_t ch : path) {
+            if (ch == L'\\')      uri += L'/';
+            else if (ch == L' ')  uri += L"%20";
+            else                  uri += ch;
         }
         return uri;
     }
 
-    // ── Send params to JS ────────────────────────────────────────────────────
+    // ── Send all 24 bands to JS ──────────────────────────────────────────────
     void sendParamsToJS() {
         if (!wvReady || !wv) return;
-        wchar_t json[2048];
-        int pos = 0;
-        pos += swprintf(json + pos, 2048 - pos, L"{\"type\":\"setParams\",\"bands\":[");
-        static const double DEF_FREQ[6] = {60,150,500,1500,4500,12000};
-        for (int b = 0; b < 6; ++b) {
-            int gi = paramIndex(b*10), fi = paramIndex(b*10+1), qi = paramIndex(b*10+2);
-            double gain = paramPlain(gi);
-            double freq = paramPlain(fi);
-            double q    = paramPlain(qi);
-            pos += swprintf(json + pos, 2048 - pos,
-                L"%s{\"id\":%d,\"gain\":%.3f,\"freq\":%.2f,\"q\":%.4f}",
-                b == 0 ? L"" : L",", b, gain, freq, q);
+        // Build JSON: {"type":"setParams","bands":[{id,gain,freq,q}×24]}
+        std::wstring json = L"{\"type\":\"setParams\",\"bands\":[";
+        for (int b = 0; b < kNumBands; ++b) {
+            int gi = paramIndex((clap_id)(b*10));
+            int fi = paramIndex((clap_id)(b*10+1));
+            int qi = paramIndex((clap_id)(b*10+2));
+            double g = gi >= 0 ? paramPlain(gi) : 0.0;
+            double f = fi >= 0 ? paramPlain(fi) : kBandDefs[b].defaultFreq;
+            double q = qi >= 0 ? paramPlain(qi) : kBandDefs[b].defaultQ;
+            wchar_t buf[128];
+            swprintf(buf, 128, L"%s{\"id\":%d,\"gain\":%.3f,\"freq\":%.2f,\"q\":%.4f}",
+                     b == 0 ? L"" : L",", b, g, f, q);
+            json += buf;
         }
-        swprintf(json + pos, 2048 - pos, L"]}");
-        wv->PostWebMessageAsJson(json);
+        json += L"]}";
+        wv->PostWebMessageAsJson(json.c_str());
     }
 
     // ── Handle JS → C++ ──────────────────────────────────────────────────────
     void onJSMessage(LPCWSTR jsonW) {
         std::wstring json(jsonW);
-        // Find "type"
         size_t tk = json.find(L"\"type\"");
         if (tk == std::wstring::npos) return;
         size_t q1 = json.find(L'"', json.find(L':', tk) + 1);
@@ -237,8 +368,8 @@ struct EKGEQClap {
 
         size_t arrStart = json.find(L'[');
         if (arrStart == std::wstring::npos) return;
-        size_t arrEnd = json.find(L']', arrStart);
-        if (arrEnd == std::wstring::npos) return;
+        size_t arrEnd = json.rfind(L']');
+        if (arrEnd == std::wstring::npos || arrEnd <= arrStart) return;
         std::wstring arr = json.substr(arrStart, arrEnd - arrStart + 1);
 
         auto parseNum = [&](const std::wstring& s, const wchar_t* key, double def) -> double {
@@ -247,19 +378,19 @@ struct EKGEQClap {
             if (k == std::wstring::npos) return def;
             size_t c = s.find(L':', k);
             if (c == std::wstring::npos) return def;
-            size_t p = c + 1;
-            while (p < s.size() && s[p] == L' ') ++p;
+            size_t pp = c + 1;
+            while (pp < s.size() && s[pp] == L' ') ++pp;
             std::wstring num;
-            while (p < s.size() && (s[p] == L'-' || (s[p] >= L'0' && s[p] <= L'9') || s[p] == L'.'))
-                num += s[p++];
+            while (pp < s.size() && (s[pp] == L'-' || (s[pp] >= L'0' && s[pp] <= L'9') || s[pp] == L'.'))
+                num += s[pp++];
             if (num.empty()) return def;
             try { return std::stod(num); } catch (...) { return def; }
         };
 
-        size_t pos = 0;
         const clap_host_params_t* hostParams =
             (const clap_host_params_t*)host->get_extension(host, CLAP_EXT_PARAMS);
 
+        size_t pos = 0;
         while (true) {
             size_t oStart = arr.find(L'{', pos);
             if (oStart == std::wstring::npos) break;
@@ -268,158 +399,241 @@ struct EKGEQClap {
             std::wstring obj = arr.substr(oStart, oEnd - oStart + 1);
 
             int id = (int)parseNum(obj, L"id", -1);
-            if (id >= 0 && id < 6) {
-                static const double DFREQ[6] = {60,150,500,1500,4500,12000};
-                double gain = std::max(-24.0, std::min(24.0, parseNum(obj, L"gain", 0.0)));
-                double freq = std::max(20.0, std::min(20000.0, parseNum(obj, L"freq", DFREQ[id])));
-                double q    = std::max(0.1,  std::min(10.0,   parseNum(obj, L"q",    1.0)));
+            if (id >= 0 && id < kNumBands) {
+                double gain = std::clamp(parseNum(obj, L"gain", 0.0), -24.0, 24.0);
+                double freq = std::clamp(parseNum(obj, L"freq", kBandDefs[id].defaultFreq), 20.0, 20000.0);
+                double q    = std::clamp(parseNum(obj, L"q",    kBandDefs[id].defaultQ), 0.1, 18.0);
 
                 auto update = [&](clap_id pid, double plain, double minV, double maxV) {
                     int idx = paramIndex(pid);
                     if (idx < 0) return;
-                    double newNorm = (plain - minV) / (maxV - minV);
-                    newNorm = std::max(0.0, std::min(1.0, newNorm));
-                    if (std::abs(newNorm - normVal[idx]) > 0.0001) {
-                        normVal[idx] = newNorm;
-                        if (hostParams)
-                            hostParams->request_flush(host);
+                    double n = std::clamp((plain - minV) / (maxV - minV), 0.0, 1.0);
+                    if (std::fabs(n - normVal[idx]) > 0.0001) {
+                        normVal[idx] = n;
+                        if (hostParams) hostParams->request_flush(host);
                     }
                 };
-                update(id * 10,     gain, -24,   24);
-                update(id * 10 + 1, freq,  20, 20000);
-                update(id * 10 + 2, q,    0.1,   10);
+                update((clap_id)(id*10),     gain, -24,    24);
+                update((clap_id)(id*10 + 1), freq,  20, 20000);
+                update((clap_id)(id*10 + 2), q,    0.1,    18);
                 rebuildFilter(id);
             }
             pos = oEnd + 1;
         }
     }
+
+    // ── Send spectrum + loopback to JS ───────────────────────────────────────
+    void sendSpectrumToJS(bool sendLoopback) {
+        if (!wvReady || !wv) return;
+        // Track spectrum
+        wchar_t json[600];
+        int pos = swprintf(json, 600, L"{\"type\":\"spectrum\",\"bands\":[");
+        for (int i = 0; i < kNumBands && pos < 560; ++i)
+            pos += swprintf(json + pos, 600 - pos, i > 0 ? L",%.5f" : L"%.5f", (double)detEnv[i]);
+        swprintf(json + pos, 600 - pos, L"]}");
+        wv->PostWebMessageAsJson(json);
+
+        if (sendLoopback && s_aria.isRunning()) {
+            pos = swprintf(json, 600, L"{\"type\":\"loopbackSpectrum\",\"bands\":[");
+            for (int i = 0; i < kNumBands && pos < 540; ++i) {
+                float v = s_aria.loopbandEnv[i].load(std::memory_order_relaxed);
+                pos += swprintf(json + pos, 600 - pos, i > 0 ? L",%.5f" : L"%.5f", (double)v);
+            }
+            swprintf(json + pos, 600 - pos, L"],\"aria\":true}");
+            wv->PostWebMessageAsJson(json);
+        }
+    }
 };
 
-// ── CLAP plugin callbacks ─────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// CLAP plugin callbacks
+// ════════════════════════════════════════════════════════════════════════════
 
 static bool ekgeq_init(const clap_plugin_t* p) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    // Initialize normVal to defaults
-    for (int i = 0; i < PARAM_COUNT; ++i) {
+    for (int i = 0; i < CLAP_NUM_PARAMS; ++i) {
         const auto& pd = PARAMS[i];
-        self->normVal[i] = (pd.def - pd.min) / (pd.max - pd.min);
+        self->normVal[i] = (pd.defV - pd.minV) / (pd.maxV - pd.minV);
     }
-    for (int b = 0; b < BAND_COUNT; ++b)
-        self->rebuildFilter(b);
+    // Init detection filters
+    for (int b = 0; b < kNumBands; ++b) {
+        BiquadCoeffs dc = makeBandpass(self->sampleRate, kBandDefs[b].defaultFreq, 2.0);
+        self->detL[b].setCoeffs(dc); self->detL[b].reset();
+        self->detR[b].setCoeffs(dc); self->detR[b].reset();
+        self->detEnv[b] = 0.0f;
+    }
+    self->rebuildAll();
     return true;
 }
 
 static void ekgeq_destroy(const clap_plugin_t* p) {
     auto* self = (EKGEQClap*)p->plugin_data;
+    s_aria.release();
     delete self;
 }
 
-static bool ekgeq_activate(const clap_plugin_t* p, double sampleRate,
-                            uint32_t /*minFrames*/, uint32_t /*maxFrames*/) {
+static bool ekgeq_activate(const clap_plugin_t* p, double sr,
+                            uint32_t /*min*/, uint32_t /*max*/) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    self->sampleRate = sampleRate;
-    for (int b = 0; b < BAND_COUNT; ++b)
-        self->rebuildFilter(b);
+    self->sampleRate = sr;
+    // Reset detection filters for new sample rate
+    for (int b = 0; b < kNumBands; ++b) {
+        BiquadCoeffs dc = makeBandpass(sr, kBandDefs[b].defaultFreq, 2.0);
+        self->detL[b].setCoeffs(dc); self->detL[b].reset();
+        self->detR[b].setCoeffs(dc); self->detR[b].reset();
+    }
+    self->rebuildAll();
+    s_aria.acquire();
     return true;
 }
 
-static void ekgeq_deactivate(const clap_plugin_t* /*p*/) {}
-static bool ekgeq_start_processing(const clap_plugin_t* /*p*/) { return true; }
-static void ekgeq_stop_processing(const clap_plugin_t* /*p*/) {}
+static void ekgeq_deactivate(const clap_plugin_t* p) {
+    s_aria.release();
+    (void)p;
+}
+
+static bool  ekgeq_start_processing(const clap_plugin_t*) { return true; }
+static void  ekgeq_stop_processing (const clap_plugin_t*) {}
+
 static void ekgeq_reset(const clap_plugin_t* p) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    for (int b = 0; b < BAND_COUNT; ++b)
-        for (int ch = 0; ch < 2; ++ch)
-            self->filters[b][ch].reset();
+    for (int b = 0; b < kNumBands; ++b) {
+        self->filters[b][0].reset(); self->filters[b][1].reset();
+        self->detL[b].reset();       self->detR[b].reset();
+        self->detEnv[b] = 0.0f;
+    }
+    self->tiltL.reset(); self->tiltR.reset();
 }
 
 static clap_process_status ekgeq_process(const clap_plugin_t* p, const clap_process_t* proc) {
     auto* self = (EKGEQClap*)p->plugin_data;
 
-    // Handle parameter events from host
-    uint32_t ev = 0;
-    uint32_t numEvents = proc->in_events->size(proc->in_events);
-    uint32_t frame = 0;
-
-    for (; frame < proc->frames_count; ) {
-        // Process events up to current frame
-        while (ev < numEvents) {
+    // 1. Consume parameter events
+    uint32_t ev = 0, numEv = proc->in_events->size(proc->in_events);
+    for (uint32_t frame = 0; frame < proc->frames_count; ) {
+        while (ev < numEv) {
             const clap_event_header_t* hdr = proc->in_events->get(proc->in_events, ev);
             if (hdr->time > frame) break;
             if (hdr->type == CLAP_EVENT_PARAM_VALUE) {
                 const auto* evt = (const clap_event_param_value_t*)hdr;
                 int idx = self->paramIndex((clap_id)evt->param_id);
                 if (idx >= 0) {
-                    self->normVal[idx] = (evt->value - PARAMS[idx].min) /
-                                         (PARAMS[idx].max - PARAMS[idx].min);
-                    if ((clap_id)evt->param_id == 100) {
+                    self->normVal[idx] = std::clamp(
+                        (evt->value - PARAMS[idx].minV) / (PARAMS[idx].maxV - PARAMS[idx].minV),
+                        0.0, 1.0);
+                    clap_id pid = (clap_id)evt->param_id;
+                    if (pid == 1000) {
                         self->bypass = (evt->value >= 0.5);
+                    } else if (pid == 1001) {
+                        self->tilt = evt->value;
+                        self->rebuildTilt();
                     } else {
-                        int band = (int)evt->param_id / 10;
-                        if (band >= 0 && band < BAND_COUNT)
-                            self->rebuildFilter(band);
+                        int band = (int)pid / 10;
+                        if (band >= 0 && band < kNumBands) self->rebuildFilter(band);
                     }
                 }
             }
             ++ev;
         }
 
-        // Process audio for this frame
         if (proc->audio_inputs_count > 0 && proc->audio_outputs_count > 0) {
             const float* in0  = proc->audio_inputs[0].data32[0];
-            const float* in1  = proc->audio_inputs[0].data32[1 < (int)proc->audio_inputs[0].channel_count ? 1 : 0];
+            const float* in1  = proc->audio_inputs[0].channel_count > 1
+                              ? proc->audio_inputs[0].data32[1] : in0;
             float*       out0 = proc->audio_outputs[0].data32[0];
-            float*       out1 = proc->audio_outputs[0].data32[1 < (int)proc->audio_outputs[0].channel_count ? 1 : 0];
+            float*       out1 = proc->audio_outputs[0].channel_count > 1
+                              ? proc->audio_outputs[0].data32[1] : out0;
 
-            if (self->bypass || proc->audio_inputs[0].constant_mask & 1) {
+            if (self->bypass) {
                 out0[frame] = in0[frame];
                 out1[frame] = in1[frame];
             } else {
-                double l = in0[frame], r = in1[frame];
-                for (int b = 0; b < BAND_COUNT; ++b) {
+                // Detection
+                double xL = in0[frame], xR = in1[frame];
+                for (int b = 0; b < kNumBands; ++b) {
+                    double yL = self->detL[b].process(xL), yR = self->detR[b].process(xR);
+                    double rms = (float)std::sqrt((yL*yL + yR*yR) * 0.5);
+                    self->detEnv[b] = (float)(0.97 * self->detEnv[b] + 0.03 * rms);
+                }
+                // EQ
+                double l = xL, r = xR;
+                for (int b = 0; b < kNumBands; ++b) {
                     l = self->filters[b][0].process(l);
                     r = self->filters[b][1].process(r);
+                }
+                if (std::fabs(self->tilt) >= 0.001) {
+                    l = self->tiltL.process(l);
+                    r = self->tiltR.process(r);
                 }
                 out0[frame] = (float)l;
                 out1[frame] = (float)r;
             }
         }
         ++frame;
-    }
 
+        // 2. C·AUTO + spectrum report every kDetInterval frames
+        if (++self->detThrottle >= self->kDetInterval) {
+            self->detThrottle = 0;
+
+            // C·AUTO correction
+            if (self->cautoEnabled && s_aria.isRunning()) {
+                float trackSum = 0.0f, mixSum = 0.0f;
+                float mixEnv[kNumBands];
+                for (int i = 0; i < kNumBands; ++i) {
+                    mixEnv[i]  = s_aria.loopbandEnv[i].load(std::memory_order_relaxed);
+                    trackSum  += self->detEnv[i];
+                    mixSum    += mixEnv[i];
+                }
+                if (trackSum > EKGEQClap::kCautoMinSig && mixSum > EKGEQClap::kCautoMinSig) {
+                    bool dirty = false;
+                    for (int i = 0; i < kNumBands; ++i) {
+                        float delta = mixEnv[i]/mixSum - self->detEnv[i]/trackSum;
+                        self->cautoGain[i] += delta * 12.0f * EKGEQClap::kCautoRate * 1000.0f;
+                        self->cautoGain[i]  = std::clamp(self->cautoGain[i],
+                                                          -EKGEQClap::kCautoMaxG,
+                                                           EKGEQClap::kCautoMaxG);
+                        dirty = true;
+                    }
+                    if (dirty) self->rebuildAll();
+                }
+            }
+
+            self->sendSpectrumToJS(true);
+        }
+    }
     return CLAP_PROCESS_CONTINUE;
 }
 
 static const void* ekgeq_get_extension(const clap_plugin_t* p, const char* id);
-static void ekgeq_on_main_thread(const clap_plugin_t* /*p*/) {}
+static void ekgeq_on_main_thread(const clap_plugin_t*) {}
 
 // ── Audio ports ───────────────────────────────────────────────────────────────
-static uint32_t ap_count(const clap_plugin_t*, bool /*isInput*/) { return 1; }
-static bool ap_get(const clap_plugin_t*, uint32_t /*idx*/, bool /*isInput*/, clap_audio_port_info_t* info) {
-    info->id             = 0;
+static uint32_t ap_count(const clap_plugin_t*, bool) { return 1; }
+static bool ap_get(const clap_plugin_t*, uint32_t, bool, clap_audio_port_info_t* info) {
+    info->id = 0;
     strcpy(info->name, "Stereo");
-    info->flags          = CLAP_AUDIO_PORT_IS_MAIN;
-    info->channel_count  = 2;
-    info->port_type      = CLAP_PORT_STEREO;
-    info->in_place_pair  = CLAP_INVALID_ID;
+    info->flags         = CLAP_AUDIO_PORT_IS_MAIN;
+    info->channel_count = 2;
+    info->port_type     = CLAP_PORT_STEREO;
+    info->in_place_pair = CLAP_INVALID_ID;
     return true;
 }
 static const clap_plugin_audio_ports_t EXT_AUDIO_PORTS = { ap_count, ap_get };
 
 // ── Parameters extension ──────────────────────────────────────────────────────
-static uint32_t par_count(const clap_plugin_t*) { return (uint32_t)PARAM_COUNT; }
+static uint32_t par_count(const clap_plugin_t*) { return (uint32_t)CLAP_NUM_PARAMS; }
 
 static bool par_get_info(const clap_plugin_t*, uint32_t idx, clap_param_info_t* info) {
-    if ((int)idx >= PARAM_COUNT) return false;
-    const auto& p = PARAMS[idx];
-    info->id    = p.id;
+    if ((int)idx >= CLAP_NUM_PARAMS) return false;
+    const auto& pd = PARAMS[idx];
+    info->id    = pd.id;
     info->flags = CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE;
-    if (p.id == 100) info->flags |= CLAP_PARAM_IS_BYPASS;
-    strncpy(info->name,   p.name,   CLAP_NAME_SIZE - 1);
-    strncpy(info->module, p.module, CLAP_PATH_SIZE - 1);
-    info->min_value     = p.min;
-    info->max_value     = p.max;
-    info->default_value = p.def;
+    if (pd.is_bypass) info->flags |= CLAP_PARAM_IS_BYPASS;
+    strncpy(info->name,   pd.name,   CLAP_NAME_SIZE - 1);
+    strncpy(info->module, pd.module, CLAP_PATH_SIZE - 1);
+    info->min_value     = pd.minV;
+    info->max_value     = pd.maxV;
+    info->default_value = pd.defV;
     info->cookie        = nullptr;
     return true;
 }
@@ -428,29 +642,27 @@ static bool par_get_value(const clap_plugin_t* p, clap_id id, double* val) {
     auto* self = (EKGEQClap*)p->plugin_data;
     int idx = self->paramIndex(id);
     if (idx < 0) return false;
-    *val = PARAMS[idx].min + self->normVal[idx] * (PARAMS[idx].max - PARAMS[idx].min);
+    *val = PARAMS[idx].minV + self->normVal[idx] * (PARAMS[idx].maxV - PARAMS[idx].minV);
     return true;
 }
 
 static bool par_value_to_text(const clap_plugin_t* p, clap_id id, double val,
                                char* buf, uint32_t size) {
-    int idx = ((EKGEQClap*)p->plugin_data)->paramIndex(id);
-    if (idx < 0) return false;
-    const auto& pd = PARAMS[idx];
-    if (id == 100) snprintf(buf, size, "%s", val >= 0.5 ? "Bypassed" : "Active");
-    else if ((id % 10) == 0) snprintf(buf, size, "%.1f dB", val);
-    else if ((id % 10) == 1) snprintf(buf, size, val >= 1000 ? "%.1f kHz" : "%.0f Hz", val >= 1000 ? val/1000 : val);
-    else snprintf(buf, size, "%.2f", val);
+    (void)p;
+    if (id == 1000)           snprintf(buf, size, "%s", val >= 0.5 ? "Bypassed" : "Active");
+    else if ((id % 10) == 0)  snprintf(buf, size, "%.1f dB", val);
+    else if ((id % 10) == 1)  snprintf(buf, size, val >= 1000 ? "%.1f kHz" : "%.0f Hz",
+                                        val >= 1000 ? val/1000.0 : val);
+    else                      snprintf(buf, size, "%.2f", val);
     return true;
 }
 
 static bool par_text_to_value(const clap_plugin_t*, clap_id, const char* txt, double* val) {
-    *val = atof(txt);
-    return true;
+    *val = atof(txt); return true;
 }
 
 static void par_flush(const clap_plugin_t* p, const clap_input_events_t* in,
-                      const clap_output_events_t* /*out*/) {
+                      const clap_output_events_t*) {
     auto* self = (EKGEQClap*)p->plugin_data;
     uint32_t n = in->size(in);
     for (uint32_t i = 0; i < n; ++i) {
@@ -459,19 +671,21 @@ static void par_flush(const clap_plugin_t* p, const clap_input_events_t* in,
             const auto* evt = (const clap_event_param_value_t*)hdr;
             int idx = self->paramIndex((clap_id)evt->param_id);
             if (idx >= 0) {
-                self->normVal[idx] = (evt->value - PARAMS[idx].min) /
-                                     (PARAMS[idx].max - PARAMS[idx].min);
-                if ((clap_id)evt->param_id == 100)
+                self->normVal[idx] = std::clamp(
+                    (evt->value - PARAMS[idx].minV) / (PARAMS[idx].maxV - PARAMS[idx].minV),
+                    0.0, 1.0);
+                clap_id pid = (clap_id)evt->param_id;
+                if (pid == 1000) {
                     self->bypass = (evt->value >= 0.5);
-                else {
-                    int band = (int)evt->param_id / 10;
-                    if (band >= 0 && band < BAND_COUNT)
-                        self->rebuildFilter(band);
+                } else if (pid == 1001) {
+                    self->tilt = evt->value; self->rebuildTilt();
+                } else {
+                    int band = (int)pid / 10;
+                    if (band >= 0 && band < kNumBands) self->rebuildFilter(band);
                 }
             }
         }
     }
-    // Push updated state to WebView2 if ready
     self->sendParamsToJS();
 }
 
@@ -482,20 +696,25 @@ static const clap_plugin_params_t EXT_PARAMS = {
 // ── State (save/load) ─────────────────────────────────────────────────────────
 static bool state_save(const clap_plugin_t* p, const clap_ostream_t* stream) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    // Write normVal array as raw doubles
     uint32_t written = 0;
     while (written < sizeof(self->normVal)) {
-        int64_t n = stream->write(stream, (const char*)self->normVal + written,
-                                  sizeof(self->normVal) - written);
+        int64_t n = stream->write(stream,
+            (const char*)self->normVal + written,
+            sizeof(self->normVal) - written);
         if (n <= 0) return false;
         written += (uint32_t)n;
+    }
+    // Also save C·AUTO gains
+    for (int i = 0; i < kNumBands; ++i) {
+        float v = self->cautoGain[i];
+        stream->write(stream, (const char*)&v, sizeof(v));
     }
     return true;
 }
 
 static bool state_load(const clap_plugin_t* p, const clap_istream_t* stream) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    double buf[PARAM_COUNT] = {};
+    double buf[CLAP_NUM_PARAMS] = {};
     uint32_t read = 0;
     while (read < sizeof(buf)) {
         int64_t n = stream->read(stream, (char*)buf + read, sizeof(buf) - read);
@@ -504,11 +723,16 @@ static bool state_load(const clap_plugin_t* p, const clap_istream_t* stream) {
     }
     if (read >= sizeof(self->normVal))
         memcpy(self->normVal, buf, sizeof(self->normVal));
-    for (int b = 0; b < BAND_COUNT; ++b) self->rebuildFilter(b);
+    // Try to restore C·AUTO gains (may not be present in old sessions)
+    for (int i = 0; i < kNumBands; ++i) {
+        float v = 0.0f;
+        if (stream->read(stream, (char*)&v, sizeof(v)) > 0)
+            self->cautoGain[i] = v;
+    }
+    self->rebuildAll();
     self->sendParamsToJS();
     return true;
 }
-
 static const clap_plugin_state_t EXT_STATE = { state_save, state_load };
 
 // ── GUI extension ─────────────────────────────────────────────────────────────
@@ -527,33 +751,27 @@ static LRESULT CALLBACK ClapWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     } else {
         self = (EKGEQClap*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     }
-
     switch (msg) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         if (self && !self->wvReady) {
             RECT r; GetClientRect(hwnd, &r);
             HBRUSH br = CreateSolidBrush(RGB(3,8,6));
             FillRect(hdc, &r, br); DeleteObject(br);
         }
-        EndPaint(hwnd, &ps);
-        return 0;
+        EndPaint(hwnd, &ps); return 0;
     }
     case WM_SETFOCUS:
         if (self && self->wvCtrl)
             self->wvCtrl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
         return 0;
-    case WM_MOUSEACTIVATE:
-        SetFocus(hwnd); return MA_ACTIVATE;
-    case WM_LBUTTONDOWN:
-    case WM_RBUTTONDOWN:
-        SetFocus(hwnd);
+    case WM_MOUSEACTIVATE: SetFocus(hwnd); return MA_ACTIVATE;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: SetFocus(hwnd);
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_SIZE:
         if (self && self->wvCtrl) {
-            RECT r { 0, 0, (LONG)LOWORD(lp), (LONG)HIWORD(lp) };
+            RECT r{0,0,(LONG)LOWORD(lp),(LONG)HIWORD(lp)};
             self->wvCtrl->put_Bounds(r);
         }
         return 0;
@@ -581,14 +799,14 @@ static WV2CreateFn loadWV2(HMODULE* outDll) {
     return fn;
 }
 
-static bool gui_is_api_supported(const clap_plugin_t*, const char* api, bool is_floating) {
-    return !is_floating && strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
+static bool gui_is_api_supported(const clap_plugin_t*, const char* api, bool floating) {
+    return !floating && strcmp(api, CLAP_WINDOW_API_WIN32) == 0;
 }
-static bool gui_get_preferred_api(const clap_plugin_t*, const char** api, bool* is_floating) {
-    *api = CLAP_WINDOW_API_WIN32; *is_floating = false; return true;
+static bool gui_get_preferred_api(const clap_plugin_t*, const char** api, bool* floating) {
+    *api = CLAP_WINDOW_API_WIN32; *floating = false; return true;
 }
-static bool gui_create(const clap_plugin_t* p, const char* /*api*/, bool /*floating*/) {
-    auto* self = (EKGEQClap*)p->plugin_data;
+static bool gui_create(const clap_plugin_t* p, const char*, bool) {
+    (void)p;
     if (!s_clapClassRegistered) {
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc); wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -618,24 +836,24 @@ static bool gui_set_scale(const clap_plugin_t*, double) { return false; }
 static bool gui_get_size(const clap_plugin_t*, uint32_t* w, uint32_t* h) {
     *w = GUI_W; *h = GUI_H; return true;
 }
-static bool gui_can_resize(const clap_plugin_t*) { return false; }
+static bool gui_can_resize    (const clap_plugin_t*) { return false; }
 static bool gui_get_resize_hints(const clap_plugin_t*, clap_gui_resize_hints_t*) { return false; }
-static bool gui_adjust_size(const clap_plugin_t*, uint32_t* w, uint32_t* h) {
+static bool gui_adjust_size   (const clap_plugin_t*, uint32_t* w, uint32_t* h) {
     *w = GUI_W; *h = GUI_H; return true;
 }
 static bool gui_set_size(const clap_plugin_t*, uint32_t, uint32_t) { return true; }
+
 static bool gui_set_parent(const clap_plugin_t* p, const clap_window_t* win) {
     auto* self = (EKGEQClap*)p->plugin_data;
-    HWND parentHwnd = (HWND)win->win32;
-
     self->guiHwnd = CreateWindowExW(
         0, CLAP_WND_CLASS, L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        0, 0, GUI_W, GUI_H, parentHwnd, nullptr, GetModuleHandle(nullptr), self);
+        0, 0, GUI_W, GUI_H, (HWND)win->win32,
+        nullptr, GetModuleHandle(nullptr), self);
     if (!self->guiHwnd) return false;
 
     WV2CreateFn createEnv = loadWV2(&self->wvDLL);
-    if (!createEnv) return true; // No WebView2 — black window, non-fatal
+    if (!createEnv) return true;
 
     createEnv(nullptr, nullptr, nullptr,
         makeCB1<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
@@ -684,32 +902,30 @@ static bool gui_set_parent(const clap_plugin_t* p, const clap_window_t* win) {
                                     [](ICoreWebView2Controller*,
                                        ICoreWebView2AcceleratorKeyPressedEventArgs* args)
                                         -> HRESULT {
-                                        args->put_Handled(FALSE);
-                                        return S_OK;
+                                        args->put_Handled(FALSE); return S_OK;
                                     }), &self->accelToken);
 
                             self->wvReady = true;
                             self->wvCtrl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-
-                            std::wstring uri = self->buildHtmlUri();
-                            self->wv->Navigate(uri.c_str());
+                            self->wv->Navigate(self->buildHtmlUri().c_str());
                             return S_OK;
                         }));
             }));
     return true;
 }
+
 static bool gui_set_transient(const clap_plugin_t*, const clap_window_t*) { return false; }
 static void gui_suggest_title(const clap_plugin_t*, const char*) {}
 static bool gui_show(const clap_plugin_t* p) {
-    auto* self = (EKGEQClap*)p->plugin_data;
-    if (self->guiHwnd) ShowWindow(self->guiHwnd, SW_SHOW);
-    if (self->wvCtrl)  self->wvCtrl->put_IsVisible(TRUE);
+    auto* s = (EKGEQClap*)p->plugin_data;
+    if (s->guiHwnd) ShowWindow(s->guiHwnd, SW_SHOW);
+    if (s->wvCtrl)  s->wvCtrl->put_IsVisible(TRUE);
     return true;
 }
 static bool gui_hide(const clap_plugin_t* p) {
-    auto* self = (EKGEQClap*)p->plugin_data;
-    if (self->guiHwnd) ShowWindow(self->guiHwnd, SW_HIDE);
-    if (self->wvCtrl)  self->wvCtrl->put_IsVisible(FALSE);
+    auto* s = (EKGEQClap*)p->plugin_data;
+    if (s->guiHwnd) ShowWindow(s->guiHwnd, SW_HIDE);
+    if (s->wvCtrl)  s->wvCtrl->put_IsVisible(FALSE);
     return true;
 }
 
@@ -721,7 +937,7 @@ static const clap_plugin_gui_t EXT_GUI = {
 };
 
 // ── get_extension dispatch ────────────────────────────────────────────────────
-static const void* ekgeq_get_extension(const clap_plugin_t* /*p*/, const char* id) {
+static const void* ekgeq_get_extension(const clap_plugin_t*, const char* id) {
     if (!strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &EXT_AUDIO_PORTS;
     if (!strcmp(id, CLAP_EXT_PARAMS))      return &EXT_PARAMS;
     if (!strcmp(id, CLAP_EXT_STATE))       return &EXT_STATE;
@@ -742,10 +958,9 @@ static const clap_plugin_descriptor_t EKGEQ_DESC = {
     "EKG\xB7\x45Q",
     "Lumina Aerospace",
     "https://luminousworks.com",
-    "",
-    "",
+    "", "",
     "1.0.0",
-    "Master EQ \xE2\x80\x94 ECG band topology. AuraTone Technology.",
+    "Master EQ \xe2\x80\x94 24 bands. AuraTone Technology. C\xc2\xb7" "AUTO + ARIA.",
     EKGEQ_FEATURES
 };
 
@@ -753,7 +968,7 @@ static const clap_plugin_descriptor_t EKGEQ_DESC = {
 static uint32_t factory_count(const clap_plugin_factory_t*) { return 1; }
 
 static const clap_plugin_descriptor_t* factory_get_descriptor(
-    const clap_plugin_factory_t*, uint32_t /*idx*/) { return &EKGEQ_DESC; }
+    const clap_plugin_factory_t*, uint32_t) { return &EKGEQ_DESC; }
 
 static const clap_plugin_t* factory_create(const clap_plugin_factory_t*,
                                             const clap_host_t* host,
@@ -781,7 +996,11 @@ static const clap_plugin_factory_t PLUGIN_FACTORY = {
 };
 
 // ── CLAP entry point (exported symbol) ───────────────────────────────────────
-static bool entry_init(const char* /*path*/) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); return true; }
+static bool entry_init(const char*) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    initParams(); // Build parameter table from kBandDefs
+    return true;
+}
 static void entry_deinit() { CoUninitialize(); }
 static const void* entry_get_factory(const char* factory_id) {
     if (!strcmp(factory_id, CLAP_PLUGIN_FACTORY_ID)) return &PLUGIN_FACTORY;
