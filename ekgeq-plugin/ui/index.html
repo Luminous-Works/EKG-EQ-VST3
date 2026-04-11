@@ -1152,7 +1152,7 @@ body.skin-clinical-whites {
     <div class="audio-row">
       <span class="audio-lbl">Input Source</span>
       <select class="audio-sel" id="audioInSel">
-        <option value="loopback">WASAPI Loopback (System Audio)</option>
+        <option value="loopback">ARIA · System Loopback</option>
       </select>
     </div>
 
@@ -1170,7 +1170,7 @@ body.skin-clinical-whites {
       <span class="audio-lbl">Sample Rate</span>
       <select class="audio-sel" id="audioSrSel">
         <option value="44100">44,100 Hz — CD standard</option>
-        <option value="48000" selected>48,000 Hz — Studio / WASAPI default</option>
+        <option value="48000" selected>48,000 Hz — Studio standard</option>
         <option value="88200">88,200 Hz — High-res</option>
         <option value="96000">96,000 Hz — High-res</option>
       </select>
@@ -5132,7 +5132,7 @@ function freqTextDown() {
 // ── Audio I/O Settings ────────────────────────────────────────────────────────
 let _audioSampleRate = 48000;
 let _audioBufferSize = 512;
-let _audioInputId    = 'loopback'; // 'loopback' = WASAPI, else deviceId
+let _audioInputId    = 'loopback'; // 'loopback' = ARIA system loopback, else deviceId
 let _audioOutputId   = 'default';
 
 async function openAudioSettings() {
@@ -5150,7 +5150,7 @@ async function openAudioSettings() {
     const outSel = document.getElementById('audioOutSel');
 
     // Reset to loopback default
-    inSel.innerHTML = '<option value="loopback">WASAPI Loopback (System Audio)</option>';
+    inSel.innerHTML = '<option value="loopback">ARIA · System Loopback</option>';
     outSel.innerHTML = '<option value="default">Default Output</option>';
 
     devices.forEach(d => {
